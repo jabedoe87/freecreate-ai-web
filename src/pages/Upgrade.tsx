@@ -1,8 +1,10 @@
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { useAuth } from "@/hooks/useAuth";
 import { Button } from "@/components/ui/button";
-import { ArrowLeft, Check, Crown, Zap, Sparkles } from "lucide-react";
+import { ArrowLeft, Check, Crown, Zap, Sparkles, Loader2 } from "lucide-react";
 import { toast } from "sonner";
+import { supabase } from "@/integrations/supabase/client";
+import { useState, useEffect } from "react";
 
 const plans = [
   {
@@ -13,7 +15,6 @@ const plans = [
     icon: Sparkles,
     features: ["5 prompts/month", "Basic templates", "Community access"],
     cta: "Current Plan",
-    disabled: true,
   },
   {
     id: "pro",
@@ -33,19 +34,39 @@ const plans = [
     icon: Crown,
     features: ["Everything in Pro", "Lifetime access", "Automation packs", "Business templates", "Priority support", "Future updates included"],
     cta: "Get Bundle — Limited",
-    highlight: false,
     badge: "BEST VALUE",
   },
 ];
 
 const Upgrade = () => {
-  const { plan } = useAuth();
+  const { plan, refreshSubscription } = useAuth();
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  const [loadingPlan, setLoadingPlan] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (searchParams.get("checkout") === "success") {
+      toast.success("Payment successful! Activating your plan...");
+      refreshSubscription();
+    }
+  }, [searchParams]);
 
   const handleUpgrade = async (planId: string) => {
-    if (planId === plan) return;
-    // Stripe checkout will be wired here
-    toast.info("Stripe checkout coming soon! Your account will be upgraded once payment is integrated.");
+    if (planId === "free" || planId === plan) return;
+    setLoadingPlan(planId);
+    try {
+      const { data, error } = await supabase.functions.invoke("create-checkout", {
+        body: { plan: planId },
+      });
+      if (error) throw error;
+      if (data?.url) {
+        window.open(data.url, "_blank");
+      }
+    } catch (err: any) {
+      toast.error(err.message || "Failed to start checkout");
+    } finally {
+      setLoadingPlan(null);
+    }
   };
 
   return (
@@ -71,6 +92,7 @@ const Upgrade = () => {
           {plans.map((p) => {
             const Icon = p.icon;
             const isCurrent = p.id === plan;
+            const isLoading = loadingPlan === p.id;
             return (
               <div
                 key={p.id}
@@ -102,9 +124,10 @@ const Upgrade = () => {
                 <Button
                   className="w-full"
                   variant={p.highlight ? "default" : "outline"}
-                  disabled={isCurrent || p.disabled}
+                  disabled={isCurrent || p.id === "free" || isLoading}
                   onClick={() => handleUpgrade(p.id)}
                 >
+                  {isLoading ? <Loader2 className="w-4 h-4 animate-spin mr-2" /> : null}
                   {isCurrent ? "Current Plan" : p.cta}
                 </Button>
               </div>
