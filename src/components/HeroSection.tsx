@@ -1,7 +1,9 @@
 import heroBg from "@/assets/hero-bg.jpg";
 import { Button } from "@/components/ui/button";
+import { useNavigate } from "react-router-dom";
 
 const HeroSection = () => {
+  const navigate = useNavigate();
   return (
     <section className="relative min-h-screen flex items-center justify-center overflow-hidden">
       {/* Background image */}
@@ -26,7 +28,7 @@ const HeroSection = () => {
           <Button
             size="lg"
             className="glow-primary bg-primary text-primary-foreground hover:bg-primary/90 text-lg px-8 py-6 font-semibold"
-            onClick={() => document.getElementById("services")?.scrollIntoView({ behavior: "smooth" })}
+            onClick={() => navigate("/auth")}
           >
             Get Started
           </Button>
