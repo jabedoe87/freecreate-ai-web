@@ -5,6 +5,8 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { BrowserRouter, Routes, Route } from "react-router-dom";
 import { AuthProvider } from "@/hooks/useAuth";
 import ProtectedRoute from "@/components/ProtectedRoute";
+import DebugBanner from "@/components/DebugBanner";
+import Redirect from "@/components/Redirect";
 import Index from "./pages/Index";
 import Auth from "./pages/Auth";
 import Dashboard from "./pages/Dashboard";
@@ -27,14 +29,21 @@ const App = () => (
         <Toaster />
         <Sonner />
         <BrowserRouter>
+          <DebugBanner />
           <Routes>
             <Route path="/" element={<Index />} />
             <Route path="/auth" element={<Auth />} />
+            <Route path="/login" element={<Auth />} />
+            <Route path="/signup" element={<Auth />} />
             <Route path="/dashboard" element={<ProtectedRoute><Dashboard /></ProtectedRoute>} />
             <Route path="/create-prompt" element={<ProtectedRoute><CreatePrompt /></ProtectedRoute>} />
             <Route path="/my-prompts" element={<ProtectedRoute><MyPrompts /></ProtectedRoute>} />
             <Route path="/templates" element={<ProtectedRoute><Templates /></ProtectedRoute>} />
             <Route path="/upgrade" element={<ProtectedRoute><Upgrade /></ProtectedRoute>} />
+            {/* Legacy redirects */}
+            <Route path="/app" element={<Redirect to="/dashboard" />} />
+            <Route path="/home" element={<Redirect to="/" />} />
+            <Route path="/pricing" element={<Redirect to="/upgrade" />} />
             <Route path="/privacy-policy" element={<PrivacyPolicy />} />
             <Route path="/terms-of-service" element={<TermsOfService />} />
             <Route path="/refund-policy" element={<RefundPolicy />} />

@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useLocation } from "react-router-dom";
 import { supabase } from "@/integrations/supabase/client";
 import { lovable } from "@/integrations/lovable";
 import { Button } from "@/components/ui/button";
@@ -10,7 +10,11 @@ import { useEffect } from "react";
 import { toast } from "sonner";
 
 const Auth = () => {
-  const [isLogin, setIsLogin] = useState(true);
+  const location = useLocation();
+  const searchParams = new URLSearchParams(location.search);
+  const modeParam = searchParams.get("mode");
+  const pathIsSignup = location.pathname === "/signup" || modeParam === "signup";
+  const [isLogin, setIsLogin] = useState(!pathIsSignup);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
