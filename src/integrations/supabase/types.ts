@@ -44,6 +44,36 @@ export type Database = {
         }
         Relationships: []
       }
+      prompt_templates: {
+        Row: {
+          category: string
+          content: string
+          created_at: string
+          id: string
+          is_featured: boolean
+          min_plan: Database["public"]["Enums"]["subscription_plan"]
+          title: string
+        }
+        Insert: {
+          category?: string
+          content: string
+          created_at?: string
+          id?: string
+          is_featured?: boolean
+          min_plan?: Database["public"]["Enums"]["subscription_plan"]
+          title: string
+        }
+        Update: {
+          category?: string
+          content?: string
+          created_at?: string
+          id?: string
+          is_featured?: boolean
+          min_plan?: Database["public"]["Enums"]["subscription_plan"]
+          title?: string
+        }
+        Relationships: []
+      }
       subscriptions: {
         Row: {
           created_at: string
@@ -75,6 +105,63 @@ export type Database = {
           status?: Database["public"]["Enums"]["subscription_status"]
           stripe_customer_id?: string | null
           stripe_subscription_id?: string | null
+          updated_at?: string
+          user_id?: string
+        }
+        Relationships: []
+      }
+      usage_tracking: {
+        Row: {
+          action: string
+          count: number
+          created_at: string
+          id: string
+          month: string
+          user_id: string
+        }
+        Insert: {
+          action?: string
+          count?: number
+          created_at?: string
+          id?: string
+          month?: string
+          user_id: string
+        }
+        Update: {
+          action?: string
+          count?: number
+          created_at?: string
+          id?: string
+          month?: string
+          user_id?: string
+        }
+        Relationships: []
+      }
+      user_prompts: {
+        Row: {
+          content: string
+          created_at: string
+          id: string
+          is_favorite: boolean
+          title: string
+          updated_at: string
+          user_id: string
+        }
+        Insert: {
+          content: string
+          created_at?: string
+          id?: string
+          is_favorite?: boolean
+          title: string
+          updated_at?: string
+          user_id: string
+        }
+        Update: {
+          content?: string
+          created_at?: string
+          id?: string
+          is_favorite?: boolean
+          title?: string
           updated_at?: string
           user_id?: string
         }
