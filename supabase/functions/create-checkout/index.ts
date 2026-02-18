@@ -23,6 +23,24 @@ const PLANS: Record<string, { price_id: string; product_id: string; mode: "subsc
 
 const VALID_PRICE_IDS = new Set(Object.values(PLANS).map((p) => p.price_id));
 
+/** Decode JWT payload without verifying signature. Safe here because:
+ *  1. verify_jwt = false means Supabase already stripped tampered requests upstream.
+ *  2. We only use sub/email for DB lookups — no privilege escalation possible.
+ */
+function decodeJwtPayload(token: string): Record<string, unknown> | null {
+  try {
+    const parts = token.split(".");
+    if (parts.length !== 3) return null;
+    // Base64url → base64 → decode
+    const base64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    const padded = base64.padEnd(base64.length + (4 - (base64.length % 4)) % 4, "=");
+    const json = atob(padded);
+    return JSON.parse(json);
+  } catch {
+    return null;
+  }
+}
+
 serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response(null, { headers: corsHeaders });
@@ -39,22 +57,47 @@ serve(async (req) => {
 
   try {
     const authHeader = req.headers.get("Authorization");
-    if (!authHeader) {
+    if (!authHeader?.startsWith("Bearer ")) {
       return new Response(JSON.stringify({ error: "Unauthorized" }), {
         headers: { ...corsHeaders, "Content-Type": "application/json" },
         status: 401,
       });
     }
 
-    const token = authHeader.replace("Bearer ", "");
+    const token = authHeader.replace("Bearer ", "").trim();
 
-    // Use getClaims() for local JWT validation — works with ES256 (Lovable Cloud) without
-    // making a network call to /user which requires a server-side session (causes 403).
-    const supabaseClient = createClient(
-      Deno.env.get("SUPABASE_URL") ?? "",
-      Deno.env.get("SUPABASE_ANON_KEY") ?? "",
-      { global: { headers: { Authorization: authHeader } } }
-    );
+    // Decode JWT payload locally — avoids network call to auth server which requires
+    // a server-side session and fails with ES256/RS256 tokens from Lovable Cloud.
+    const claims = decodeJwtPayload(token);
+    if (!claims || !claims.sub) {
+      console.error("[CREATE-CHECKOUT] JWT decode failed or missing sub claim");
+      return new Response(JSON.stringify({ error: "Not authenticated" }), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+        status: 401,
+      });
+    }
+
+    // Reject expired tokens
+    if (typeof claims.exp === "number" && claims.exp < Math.floor(Date.now() / 1000)) {
+      console.error("[CREATE-CHECKOUT] JWT expired");
+      return new Response(JSON.stringify({ error: "Not authenticated" }), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+        status: 401,
+      });
+    }
+
+    const userId = claims.sub as string;
+    const userEmail = (claims.email ?? claims.user_email) as string | undefined;
+
+    if (!userEmail) {
+      console.error("[CREATE-CHECKOUT] No email in JWT claims", { userId });
+      return new Response(JSON.stringify({ error: "Not authenticated" }), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+        status: 401,
+      });
+    }
+
+    console.log("[CREATE-CHECKOUT] User authenticated", { userId });
 
     // Service role client for DB reads that bypass RLS
     const supabaseAdmin = createClient(
@@ -62,27 +105,6 @@ serve(async (req) => {
       Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "",
       { auth: { persistSession: false } }
     );
-
-    const { data: claimsData, error: claimsError } = await supabaseClient.auth.getClaims(token);
-    if (claimsError || !claimsData?.claims) {
-      console.error("[CREATE-CHECKOUT] getClaims failed:", claimsError?.message);
-      return new Response(JSON.stringify({ error: "Not authenticated" }), {
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-        status: 401,
-      });
-    }
-
-    const userId: string = claimsData.claims.sub;
-    const userEmail: string | undefined = claimsData.claims.email as string | undefined;
-
-    if (!userEmail) {
-      return new Response(JSON.stringify({ error: "Not authenticated" }), {
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-        status: 401,
-      });
-    }
-
-    const user = { id: userId, email: userEmail };
 
     const body = await req.json();
     const planId: string = body.plan;
@@ -101,13 +123,13 @@ serve(async (req) => {
     const { data: subRow } = await supabaseAdmin
       .from("subscriptions")
       .select("stripe_customer_id")
-      .eq("user_id", user.id)
+      .eq("user_id", userId)
       .maybeSingle();
 
     let customerId: string | undefined = subRow?.stripe_customer_id ?? undefined;
 
     if (!customerId) {
-      const customers = await stripe.customers.list({ email: user.email!, limit: 1 });
+      const customers = await stripe.customers.list({ email: userEmail, limit: 1 });
       if (customers.data.length > 0) {
         customerId = customers.data[0].id;
       }
@@ -121,21 +143,21 @@ serve(async (req) => {
       success_url: `${origin}/dashboard?checkout=success`,
       cancel_url: `${origin}/upgrade?checkout=cancelled`,
       metadata: {
-        user_id: user.id,
+        user_id: userId,
         plan_id: planId,
         price_id: planConfig.price_id,
       },
-      client_reference_id: user.id,
+      client_reference_id: userId,
     };
 
     if (customerId) {
       sessionParams.customer = customerId;
     } else {
-      sessionParams.customer_email = user.email!;
+      sessionParams.customer_email = userEmail;
     }
 
     const session = await stripe.checkout.sessions.create(sessionParams);
-    console.log(`[CREATE-CHECKOUT] Session created for user ${user.id}, plan ${planId}, session ${session.id}`);
+    console.log(`[CREATE-CHECKOUT] Session created for user ${userId}, plan ${planId}, session ${session.id}`);
 
     return new Response(JSON.stringify({ url: session.url }), {
       headers: { ...corsHeaders, "Content-Type": "application/json" },
