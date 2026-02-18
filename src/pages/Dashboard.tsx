@@ -7,6 +7,7 @@ import { LogOut, Sparkles, Crown, Plus, BookOpen, Layout, RefreshCw } from "luci
 import PlanStatusCard from "@/components/PlanStatusCard";
 import UpgradeLimitModal from "@/components/UpgradeLimitModal";
 import { toast } from "sonner";
+import { supabase } from "@/integrations/supabase/client";
 
 const planLabels: Record<string, { label: string; icon: typeof Sparkles }> = {
   free: { label: "Free Plan", icon: Sparkles },
@@ -21,26 +22,46 @@ const Dashboard = () => {
   const [searchParams, setSearchParams] = useSearchParams();
   const [showUpgradeModal, setShowUpgradeModal] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  // Key used to force PlanStatusCard to remount and refetch after billing refresh
+  const [planCardKey, setPlanCardKey] = useState(0);
 
   const currentPlan = planLabels[plan] || planLabels.free;
   const PlanIcon = currentPlan.icon;
 
-  // Detect post-checkout redirect and refresh subscription state
+  // Detect post-checkout redirect and refresh session + subscription state
   useEffect(() => {
     if (searchParams.get("checkout") === "success") {
-      // Remove param from URL so refresh doesn't re-trigger
+      // Remove param so refresh doesn't re-trigger on navigation
       setSearchParams({}, { replace: true });
-      handleRefreshBilling(true);
+      handlePostCheckoutRefresh();
     }
   }, []);
 
-  const handleRefreshBilling = async (silent = false) => {
+  const handlePostCheckoutRefresh = async () => {
+    setRefreshing(true);
+    try {
+      // Force a session refresh so JWT reflects any new plan claims
+      await supabase.auth.refreshSession();
+      await refreshSubscription();
+      // Remount PlanStatusCard to fetch latest data from DB
+      setPlanCardKey((k) => k + 1);
+      toast.success("Plan activated! Your billing status is up to date.");
+    } catch {
+      toast.error("Could not refresh billing status");
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
+  const handleRefreshBilling = async () => {
     setRefreshing(true);
     try {
       await refreshSubscription();
-      if (!silent) toast.success("Billing status refreshed");
+      // Remount PlanStatusCard to fetch live data
+      setPlanCardKey((k) => k + 1);
+      toast.success("Billing status refreshed");
     } catch {
-      if (!silent) toast.error("Could not refresh billing status");
+      toast.error("Could not refresh billing status");
     } finally {
       setRefreshing(false);
     }
@@ -77,13 +98,13 @@ const Dashboard = () => {
           <p className="text-muted-foreground">Your AI-powered creative workspace.</p>
         </div>
 
-        {/* Plan status card + refresh billing button */}
+        {/* Plan status card always fetches live data — key forces remount on billing refresh */}
         <div className="mb-8 space-y-3">
-          <PlanStatusCard />
+          <PlanStatusCard key={planCardKey} />
           <Button
             variant="ghost"
             size="sm"
-            onClick={() => handleRefreshBilling(false)}
+            onClick={handleRefreshBilling}
             disabled={refreshing}
             className="text-muted-foreground"
           >
@@ -101,7 +122,7 @@ const Dashboard = () => {
             <Button
               className="w-full"
               onClick={() => {
-                // Gate at dashboard level for instant feedback
+                // Gate at dashboard level for immediate user feedback before navigation
                 if (!canGenerate && plan === "free") {
                   setShowUpgradeModal(true);
                   return;
