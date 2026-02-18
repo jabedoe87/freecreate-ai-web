@@ -92,12 +92,22 @@ serve(async (req) => {
       }
     }
 
-    // No active sub
-    await supabaseClient.from("subscriptions").update({
-      plan: "free", status: "active", stripe_customer_id: customerId,
-    }).eq("user_id", user.id);
+    // No active Stripe sub found — check current DB plan before downgrading
+    // Never downgrade bundle (lifetime) or pro that may not yet be in Stripe list
+    const { data: currentSub } = await supabaseClient
+      .from("subscriptions")
+      .select("plan")
+      .eq("user_id", user.id)
+      .maybeSingle();
 
-    return new Response(JSON.stringify({ subscribed: false, plan: "free" }), {
+    // Only mark as free if the DB already agrees — avoids overwriting webhook-set plans
+    if (!currentSub?.plan || currentSub.plan === "free") {
+      await supabaseClient.from("subscriptions").update({
+        plan: "free", status: "active", stripe_customer_id: customerId,
+      }).eq("user_id", user.id);
+    }
+
+    return new Response(JSON.stringify({ subscribed: false, plan: currentSub?.plan || "free" }), {
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
   } catch (error) {

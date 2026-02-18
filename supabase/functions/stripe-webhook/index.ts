@@ -132,13 +132,9 @@ serve(async (req) => {
           }
         }
 
-        // Update profile — stripe_customer_id is needed for portal + future webhook lookups
-        const { error: profileErr } = await supabase
-          .from("profiles")
-          .update({ stripe_customer_id: customerId ?? null })
-          .eq("user_id", userId);
-        if (profileErr) console.error("[STRIPE-WEBHOOK] Profile update error:", profileErr.message);
-        else log("Profile stripe_customer_id updated", { userId, customerId });
+        // profiles table has no stripe_customer_id; store it only on subscriptions
+        // Just log that we've identified the customer for audit purposes
+        log("Profile resolved for user", { userId, customerId });
 
         // Upsert subscription row — conflict on user_id to handle re-subscriptions
         const { error: subErr } = await supabase.from("subscriptions").update({

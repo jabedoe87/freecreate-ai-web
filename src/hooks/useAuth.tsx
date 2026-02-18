@@ -37,24 +37,30 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
   };
 
   // Always read directly from DB — never rely on stale check-subscription edge function cache
+  // Accepts explicit userId to avoid stale closure bug when called from onAuthStateChange
   const refreshSubscription = useCallback(async (currentUser?: User | null) => {
+    // Prefer the explicitly-passed user to avoid capturing a stale `user` from closure
     const uid = currentUser?.id ?? user?.id;
     if (!uid) return;
     try {
-      // Primary: read directly from subscriptions table for instant accuracy post-checkout
-      const { data } = await supabase
+      const { data, error } = await supabase
         .from("subscriptions")
         .select("plan, status")
         .eq("user_id", uid)
         .maybeSingle();
 
+      if (error) {
+        console.error("[useAuth] refreshSubscription query error:", error.message);
+        return;
+      }
       if (data?.plan) {
         setPlan(data.plan as SubscriptionPlan);
       }
     } catch (err) {
       console.error("[useAuth] refreshSubscription error:", err);
     }
-  }, [user]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     let mounted = true;
@@ -91,11 +97,25 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
   }, []);
 
   // Periodic subscription refresh every 60s to catch webhook-triggered updates
+  // Capture user via ref to avoid re-creating interval on every user state change
   useEffect(() => {
     if (!user) return;
-    const interval = setInterval(() => refreshSubscription(), 60000);
+    const uid = user.id;
+    const interval = setInterval(async () => {
+      try {
+        const { data } = await supabase
+          .from("subscriptions")
+          .select("plan, status")
+          .eq("user_id", uid)
+          .maybeSingle();
+        if (data?.plan) setPlan(data.plan as SubscriptionPlan);
+      } catch (e) {
+        console.error("[useAuth] periodic refresh error:", e);
+      }
+    }, 60000);
     return () => clearInterval(interval);
-  }, [user, refreshSubscription]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.id]);
 
   const signOut = async () => {
     await supabase.auth.signOut();
