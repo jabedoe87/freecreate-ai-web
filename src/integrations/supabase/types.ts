@@ -74,6 +74,39 @@ export type Database = {
         }
         Relationships: []
       }
+      stripe_events: {
+        Row: {
+          created_at: string
+          customer_id: string | null
+          error: string | null
+          event_id: string
+          id: string
+          status: string
+          type: string
+          user_id: string | null
+        }
+        Insert: {
+          created_at?: string
+          customer_id?: string | null
+          error?: string | null
+          event_id: string
+          id?: string
+          status?: string
+          type: string
+          user_id?: string | null
+        }
+        Update: {
+          created_at?: string
+          customer_id?: string | null
+          error?: string | null
+          event_id?: string
+          id?: string
+          status?: string
+          type?: string
+          user_id?: string | null
+        }
+        Relationships: []
+      }
       subscriptions: {
         Row: {
           created_at: string

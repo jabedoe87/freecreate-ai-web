@@ -3,6 +3,7 @@ import { useUsage } from "@/hooks/useUsage";
 import { Button } from "@/components/ui/button";
 import { useNavigate } from "react-router-dom";
 import { LogOut, Sparkles, Crown, Plus, BookOpen, Layout, Zap } from "lucide-react";
+import PlanStatusCard from "@/components/PlanStatusCard";
 
 const planLabels: Record<string, { label: string; icon: typeof Sparkles }> = {
   free: { label: "Free Plan", icon: Sparkles },
@@ -46,25 +47,12 @@ const Dashboard = () => {
           <h1 className="text-3xl font-bold text-foreground">
             Welcome{profile?.display_name ? `, ${profile.display_name}` : ""}!
           </h1>
-          <p className="text-muted-foreground">Your AI-powered creative workspace.</p>
+        <p className="text-muted-foreground">Your AI-powered creative workspace.</p>
         </div>
 
-        {/* Usage bar */}
-        <div className="bg-card border border-border rounded-xl p-4 mb-8 flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <Zap className="w-5 h-5 text-primary" />
-            <div>
-              <p className="text-sm font-medium text-foreground">
-                {remaining}/{limit} generations remaining
-              </p>
-              <p className="text-xs text-muted-foreground">Resets monthly</p>
-            </div>
-          </div>
-          {!canGenerate && (
-            <Button size="sm" onClick={() => navigate("/upgrade")}>
-              Upgrade
-            </Button>
-          )}
+        {/* Plan status card replaces raw usage bar */}
+        <div className="mb-8">
+          <PlanStatusCard />
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-3 gap-6">

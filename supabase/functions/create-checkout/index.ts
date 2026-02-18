@@ -58,7 +58,13 @@ serve(async (req) => {
       mode: planConfig.mode as "subscription" | "payment",
       success_url: `${origin}/dashboard?checkout=success`,
       cancel_url: `${origin}/upgrade?checkout=cancelled`,
-      metadata: { user_id: user.id, plan },
+      // Full metadata contract required by webhook fulfillment
+      metadata: {
+        user_id: user.id,
+        plan_id: plan,
+        price_id: planConfig.price_id,
+      },
+      client_reference_id: user.id,
     };
 
     const session = await stripe.checkout.sessions.create(sessionParams);
