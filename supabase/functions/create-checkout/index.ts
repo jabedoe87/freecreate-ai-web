@@ -17,11 +17,10 @@ const PLANS: Record<string, { price_id: string; product_id: string; mode: "subsc
   bundle: {
     price_id: "price_1T1fRODHxEfwTYTRSpZ7Zr1W",
     product_id: "prod_TzekhtWD8qlVi8",
-    mode: "payment", // Bundle is a one-time lifetime purchase
+    mode: "payment",
   },
 };
 
-// Set of valid price IDs for validation
 const VALID_PRICE_IDS = new Set(Object.values(PLANS).map((p) => p.price_id));
 
 serve(async (req) => {
@@ -38,19 +37,6 @@ serve(async (req) => {
     });
   }
 
-  // Anon client is sufficient for auth token validation only
-  const supabaseClient = createClient(
-    Deno.env.get("SUPABASE_URL") ?? "",
-    Deno.env.get("SUPABASE_ANON_KEY") ?? ""
-  );
-
-  // Service role for reading stripe_customer_id without RLS restrictions
-  const supabaseAdmin = createClient(
-    Deno.env.get("SUPABASE_URL") ?? "",
-    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "",
-    { auth: { persistSession: false } }
-  );
-
   try {
     const authHeader = req.headers.get("Authorization");
     if (!authHeader) {
@@ -60,32 +46,37 @@ serve(async (req) => {
       });
     }
 
-  const token = authHeader.replace("Bearer ", "");
+    const token = authHeader.replace("Bearer ", "");
 
-    // Use getClaims for ES256 JWT validation (Lovable Cloud uses ES256, not HS256)
-    const { data: claimsData, error: claimsError } = await supabaseClient.auth.getClaims(token);
-    if (claimsError || !claimsData?.claims) {
-      console.error("[CREATE-CHECKOUT] getClaims failed:", claimsError?.message);
+    // Pass auth header in global headers so getUser(token) validates against the auth server
+    // This works with both HS256 and ES256 (Lovable Cloud) signed JWTs
+    const supabaseClient = createClient(
+      Deno.env.get("SUPABASE_URL") ?? "",
+      Deno.env.get("SUPABASE_ANON_KEY") ?? "",
+      { global: { headers: { Authorization: authHeader } } }
+    );
+
+    // Service role client for DB reads that bypass RLS
+    const supabaseAdmin = createClient(
+      Deno.env.get("SUPABASE_URL") ?? "",
+      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "",
+      { auth: { persistSession: false } }
+    );
+
+    const { data: userData, error: userError } = await supabaseClient.auth.getUser(token);
+    if (userError || !userData.user?.email) {
+      console.error("[CREATE-CHECKOUT] getUser failed:", userError?.message);
       return new Response(JSON.stringify({ error: "Not authenticated" }), {
         headers: { ...corsHeaders, "Content-Type": "application/json" },
         status: 401,
       });
     }
-    const userId = claimsData.claims.sub;
-    const userEmail = claimsData.claims.email as string | undefined;
-    if (!userId || !userEmail) {
-      return new Response(JSON.stringify({ error: "Not authenticated" }), {
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-        status: 401,
-      });
-    }
-    const user = { id: userId, email: userEmail };
+    const user = userData.user;
 
     const body = await req.json();
     const planId: string = body.plan;
     const planConfig = PLANS[planId];
 
-    // Validate plan exists and its price_id is in our allowed set
     if (!planConfig || !VALID_PRICE_IDS.has(planConfig.price_id)) {
       return new Response(JSON.stringify({ error: "Invalid price" }), {
         headers: { ...corsHeaders, "Content-Type": "application/json" },
@@ -95,7 +86,7 @@ serve(async (req) => {
 
     const stripe = new Stripe(stripeKey, { apiVersion: "2025-08-27.basil" });
 
-    // Try to reuse existing Stripe customer to avoid duplicate customer records
+    // Try to reuse existing Stripe customer
     const { data: subRow } = await supabaseAdmin
       .from("subscriptions")
       .select("stripe_customer_id")
@@ -104,7 +95,6 @@ serve(async (req) => {
 
     let customerId: string | undefined = subRow?.stripe_customer_id ?? undefined;
 
-    // Fallback: look up by email if no stored customer id
     if (!customerId) {
       const customers = await stripe.customers.list({ email: user.email!, limit: 1 });
       if (customers.data.length > 0) {
@@ -119,7 +109,6 @@ serve(async (req) => {
       line_items: [{ price: planConfig.price_id, quantity: 1 }],
       success_url: `${origin}/dashboard?checkout=success`,
       cancel_url: `${origin}/upgrade?checkout=cancelled`,
-      // Full metadata contract required for webhook fulfillment
       metadata: {
         user_id: user.id,
         plan_id: planId,
@@ -128,7 +117,6 @@ serve(async (req) => {
       client_reference_id: user.id,
     };
 
-    // Attach to existing customer or use email to create one
     if (customerId) {
       sessionParams.customer = customerId;
     } else {

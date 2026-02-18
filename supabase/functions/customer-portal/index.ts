@@ -21,13 +21,6 @@ serve(async (req) => {
     });
   }
 
-  // Service role required to read stripe_customer_id without being blocked by RLS
-  const supabase = createClient(
-    Deno.env.get("SUPABASE_URL") ?? "",
-    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "",
-    { auth: { persistSession: false } }
-  );
-
   try {
     const authHeader = req.headers.get("Authorization");
     if (!authHeader) {
@@ -37,14 +30,29 @@ serve(async (req) => {
     }
 
     const token = authHeader.replace("Bearer ", "");
-    const { data: claimsData, error: claimsError } = await supabase.auth.getClaims(token);
-    if (claimsError || !claimsData?.claims) {
-      console.error("[CUSTOMER-PORTAL] getClaims failed:", claimsError?.message);
+
+    // Anon client with forwarded auth header — getUser(token) validates against auth server
+    const supabaseAnon = createClient(
+      Deno.env.get("SUPABASE_URL") ?? "",
+      Deno.env.get("SUPABASE_ANON_KEY") ?? "",
+      { global: { headers: { Authorization: authHeader } } }
+    );
+
+    // Service role for reading stripe_customer_id without RLS
+    const supabase = createClient(
+      Deno.env.get("SUPABASE_URL") ?? "",
+      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "",
+      { auth: { persistSession: false } }
+    );
+
+    const { data: userData, error: userError } = await supabaseAnon.auth.getUser(token);
+    if (userError || !userData.user) {
+      console.error("[CUSTOMER-PORTAL] getUser failed:", userError?.message);
       return new Response(JSON.stringify({ error: "Not authenticated" }), {
         status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
-    const user = { id: claimsData.claims.sub, email: claimsData.claims.email as string | undefined };
+    const user = userData.user;
     log("User authenticated", { userId: user.id });
 
     // Fetch stripe_customer_id stored during checkout fulfillment
