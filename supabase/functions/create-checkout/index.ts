@@ -60,15 +60,26 @@ serve(async (req) => {
       });
     }
 
-    const token = authHeader.replace("Bearer ", "");
-    const { data: userData, error: userError } = await supabaseClient.auth.getUser(token);
-    if (userError || !userData.user?.email) {
+  const token = authHeader.replace("Bearer ", "");
+
+    // Use getClaims for ES256 JWT validation (Lovable Cloud uses ES256, not HS256)
+    const { data: claimsData, error: claimsError } = await supabaseClient.auth.getClaims(token);
+    if (claimsError || !claimsData?.claims) {
+      console.error("[CREATE-CHECKOUT] getClaims failed:", claimsError?.message);
       return new Response(JSON.stringify({ error: "Not authenticated" }), {
         headers: { ...corsHeaders, "Content-Type": "application/json" },
         status: 401,
       });
     }
-    const user = userData.user;
+    const userId = claimsData.claims.sub;
+    const userEmail = claimsData.claims.email as string | undefined;
+    if (!userId || !userEmail) {
+      return new Response(JSON.stringify({ error: "Not authenticated" }), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+        status: 401,
+      });
+    }
+    const user = { id: userId, email: userEmail };
 
     const body = await req.json();
     const planId: string = body.plan;

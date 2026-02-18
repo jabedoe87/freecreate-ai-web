@@ -37,13 +37,14 @@ serve(async (req) => {
     }
 
     const token = authHeader.replace("Bearer ", "");
-    const { data: userData, error: userError } = await supabase.auth.getUser(token);
-    if (userError || !userData.user) {
+    const { data: claimsData, error: claimsError } = await supabase.auth.getClaims(token);
+    if (claimsError || !claimsData?.claims) {
+      console.error("[CUSTOMER-PORTAL] getClaims failed:", claimsError?.message);
       return new Response(JSON.stringify({ error: "Not authenticated" }), {
         status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
-    const user = userData.user;
+    const user = { id: claimsData.claims.sub, email: claimsData.claims.email as string | undefined };
     log("User authenticated", { userId: user.id });
 
     // Fetch stripe_customer_id stored during checkout fulfillment
