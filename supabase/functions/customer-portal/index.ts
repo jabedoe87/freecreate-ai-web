@@ -31,7 +31,8 @@ serve(async (req) => {
 
     const token = authHeader.replace("Bearer ", "");
 
-    // Anon client with forwarded auth header — getUser(token) validates against auth server
+    // Use getClaims() for local JWT validation — works with ES256 (Lovable Cloud) without
+    // making a network call to /user which requires a server-side session (causes 403).
     const supabaseAnon = createClient(
       Deno.env.get("SUPABASE_URL") ?? "",
       Deno.env.get("SUPABASE_ANON_KEY") ?? "",
@@ -45,14 +46,15 @@ serve(async (req) => {
       { auth: { persistSession: false } }
     );
 
-    const { data: userData, error: userError } = await supabaseAnon.auth.getUser(token);
-    if (userError || !userData.user) {
-      console.error("[CUSTOMER-PORTAL] getUser failed:", userError?.message);
+    const { data: claimsData, error: claimsError } = await supabaseAnon.auth.getClaims(token);
+    if (claimsError || !claimsData?.claims) {
+      console.error("[CUSTOMER-PORTAL] getClaims failed:", claimsError?.message);
       return new Response(JSON.stringify({ error: "Not authenticated" }), {
         status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
-    const user = userData.user;
+
+    const user = { id: claimsData.claims.sub, email: claimsData.claims.email as string | undefined };
     log("User authenticated", { userId: user.id });
 
     // Fetch stripe_customer_id stored during checkout fulfillment
