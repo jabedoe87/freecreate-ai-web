@@ -47,14 +47,16 @@ serve(async (req) => {
     // Check active subscriptions (Pro)
     const subs = await stripe.subscriptions.list({ customer: customerId, status: "active", limit: 1 });
     if (subs.data.length > 0) {
-      const productId = subs.data[0].items.data[0].price.product as string;
+      const sub = subs.data[0];
+      const productId = sub.items.data[0].price.product as string;
       const plan = PRODUCT_TO_PLAN[productId] || "pro";
-      const endDate = new Date(subs.data[0].current_period_end * 1000).toISOString();
+      const periodEnd = (sub as any).current_period_end ?? sub.items?.data?.[0]?.current_period_end;
+      const endDate = periodEnd ? new Date(periodEnd * 1000).toISOString() : null;
 
       // Sync to DB
       await supabaseClient.from("subscriptions").update({
         plan, status: "active", stripe_customer_id: customerId,
-        stripe_subscription_id: subs.data[0].id, current_period_end: endDate,
+        stripe_subscription_id: sub.id, current_period_end: endDate,
       }).eq("user_id", user.id);
 
       return new Response(JSON.stringify({ subscribed: true, plan, subscription_end: endDate }), {
