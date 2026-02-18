@@ -11,7 +11,8 @@ export const usePortal = () => {
       const { data, error } = await supabase.functions.invoke("customer-portal");
       if (error) throw error;
       if (data?.url) {
-        window.open(data.url, "_blank");
+        // Use location.assign for mobile compatibility — window.open is blocked by popup blockers
+        window.location.assign(data.url);
       } else {
         throw new Error("No portal URL returned");
       }
