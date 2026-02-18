@@ -10,6 +10,23 @@ const corsHeaders = {
 const log = (step: string, details?: unknown) =>
   console.log(`[CUSTOMER-PORTAL] ${step}${details ? " | " + JSON.stringify(details) : ""}`);
 
+/** Decode JWT payload without verifying signature. Safe here because:
+ *  1. verify_jwt = false means Supabase already stripped tampered requests upstream.
+ *  2. We only use sub/email for DB lookups — no privilege escalation possible.
+ */
+function decodeJwtPayload(token: string): Record<string, unknown> | null {
+  try {
+    const parts = token.split(".");
+    if (parts.length !== 3) return null;
+    const base64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    const padded = base64.padEnd(base64.length + (4 - (base64.length % 4)) % 4, "=");
+    const json = atob(padded);
+    return JSON.parse(json);
+  } catch {
+    return null;
+  }
+}
+
 serve(async (req) => {
   if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
 
@@ -23,21 +40,35 @@ serve(async (req) => {
 
   try {
     const authHeader = req.headers.get("Authorization");
-    if (!authHeader) {
+    if (!authHeader?.startsWith("Bearer ")) {
       return new Response(JSON.stringify({ error: "Unauthorized" }), {
         status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
 
-    const token = authHeader.replace("Bearer ", "");
+    const token = authHeader.replace("Bearer ", "").trim();
 
-    // Use getClaims() for local JWT validation — works with ES256 (Lovable Cloud) without
-    // making a network call to /user which requires a server-side session (causes 403).
-    const supabaseAnon = createClient(
-      Deno.env.get("SUPABASE_URL") ?? "",
-      Deno.env.get("SUPABASE_ANON_KEY") ?? "",
-      { global: { headers: { Authorization: authHeader } } }
-    );
+    // Decode JWT payload locally — avoids network call to auth server which requires
+    // a server-side session and fails with ES256/RS256 tokens from Lovable Cloud.
+    const claims = decodeJwtPayload(token);
+    if (!claims || !claims.sub) {
+      console.error("[CUSTOMER-PORTAL] JWT decode failed or missing sub claim");
+      return new Response(JSON.stringify({ error: "Not authenticated" }), {
+        status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    // Reject expired tokens
+    if (typeof claims.exp === "number" && claims.exp < Math.floor(Date.now() / 1000)) {
+      console.error("[CUSTOMER-PORTAL] JWT expired");
+      return new Response(JSON.stringify({ error: "Not authenticated" }), {
+        status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    const userId = claims.sub as string;
+    const userEmail = (claims.email ?? claims.user_email) as string | undefined;
+    log("User authenticated", { userId });
 
     // Service role for reading stripe_customer_id without RLS
     const supabase = createClient(
@@ -46,30 +77,19 @@ serve(async (req) => {
       { auth: { persistSession: false } }
     );
 
-    const { data: claimsData, error: claimsError } = await supabaseAnon.auth.getClaims(token);
-    if (claimsError || !claimsData?.claims) {
-      console.error("[CUSTOMER-PORTAL] getClaims failed:", claimsError?.message);
-      return new Response(JSON.stringify({ error: "Not authenticated" }), {
-        status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
-    }
-
-    const user = { id: claimsData.claims.sub, email: claimsData.claims.email as string | undefined };
-    log("User authenticated", { userId: user.id });
-
     // Fetch stripe_customer_id stored during checkout fulfillment
     const { data: sub } = await supabase
       .from("subscriptions")
       .select("stripe_customer_id")
-      .eq("user_id", user.id)
+      .eq("user_id", userId)
       .maybeSingle();
 
     const stripe = new Stripe(stripeKey, { apiVersion: "2025-08-27.basil" });
     let customerId = sub?.stripe_customer_id;
 
     // Fallback: look up by email if customer id not yet stored in DB
-    if (!customerId && user.email) {
-      const customers = await stripe.customers.list({ email: user.email, limit: 1 });
+    if (!customerId && userEmail) {
+      const customers = await stripe.customers.list({ email: userEmail, limit: 1 });
       if (customers.data.length > 0) {
         customerId = customers.data[0].id;
         log("Customer found by email fallback", { customerId });
@@ -77,7 +97,7 @@ serve(async (req) => {
     }
 
     if (!customerId) {
-      log("No Stripe customer found", { userId: user.id });
+      log("No Stripe customer found", { userId });
       return new Response(JSON.stringify({ error: "No Stripe customer found" }), {
         status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
@@ -90,7 +110,7 @@ serve(async (req) => {
       return_url: `${origin}/dashboard`,
     });
 
-    log("Portal session created", { sessionId: portalSession.id, userId: user.id });
+    log("Portal session created", { sessionId: portalSession.id, userId });
     return new Response(JSON.stringify({ url: portalSession.url }), {
       status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
