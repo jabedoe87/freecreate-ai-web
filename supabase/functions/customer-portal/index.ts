@@ -8,7 +8,7 @@ const corsHeaders = {
 };
 
 const log = (step: string, details?: unknown) =>
-  console.log(`[CUSTOMER-PORTAL] ${step}${details ? " - " + JSON.stringify(details) : ""}`);
+  console.log(`[CUSTOMER-PORTAL] ${step}${details ? " | " + JSON.stringify(details) : ""}`);
 
 serve(async (req) => {
   if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
@@ -21,7 +21,7 @@ serve(async (req) => {
     });
   }
 
-  // Service role client for reading stripe_customer_id without RLS restrictions
+  // Service role required to read stripe_customer_id without being blocked by RLS
   const supabase = createClient(
     Deno.env.get("SUPABASE_URL") ?? "",
     Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "",
@@ -59,22 +59,27 @@ serve(async (req) => {
     // Fallback: look up by email if customer id not yet stored in DB
     if (!customerId && user.email) {
       const customers = await stripe.customers.list({ email: user.email, limit: 1 });
-      if (customers.data.length > 0) customerId = customers.data[0].id;
+      if (customers.data.length > 0) {
+        customerId = customers.data[0].id;
+        log("Customer found by email fallback", { customerId });
+      }
     }
 
     if (!customerId) {
+      log("No Stripe customer found", { userId: user.id });
       return new Response(JSON.stringify({ error: "No Stripe customer found" }), {
         status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
 
+    // Use origin from request for dynamic return URL — supports preview + production domains
     const origin = req.headers.get("origin") || "https://freecreate-ai-web.lovable.app";
     const portalSession = await stripe.billingPortal.sessions.create({
       customer: customerId,
       return_url: `${origin}/dashboard`,
     });
 
-    log("Portal session created", { sessionId: portalSession.id });
+    log("Portal session created", { sessionId: portalSession.id, userId: user.id });
     return new Response(JSON.stringify({ url: portalSession.url }), {
       status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" },
     });

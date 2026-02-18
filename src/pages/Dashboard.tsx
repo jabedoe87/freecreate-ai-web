@@ -28,10 +28,10 @@ const Dashboard = () => {
   const currentPlan = planLabels[plan] || planLabels.free;
   const PlanIcon = currentPlan.icon;
 
-  // Detect post-checkout redirect and refresh session + subscription state
+  // Detect post-checkout redirect and refresh session + subscription state immediately
   useEffect(() => {
     if (searchParams.get("checkout") === "success") {
-      // Remove param so refresh doesn't re-trigger on navigation
+      // Remove param so refresh doesn't re-trigger on back-navigation
       setSearchParams({}, { replace: true });
       handlePostCheckoutRefresh();
     }
@@ -40,14 +40,37 @@ const Dashboard = () => {
   const handlePostCheckoutRefresh = async () => {
     setRefreshing(true);
     try {
-      // Force a session refresh so JWT reflects any new plan claims
+      // Force JWT refresh so the new plan is reflected in token claims
       await supabase.auth.refreshSession();
-      await refreshSubscription();
-      // Remount PlanStatusCard to fetch latest data from DB
-      setPlanCardKey((k) => k + 1);
-      toast.success("Plan activated! Your billing status is up to date.");
-    } catch {
-      toast.error("Could not refresh billing status");
+      // Poll until DB reflects the new plan (webhook may arrive within seconds)
+      let attempts = 0;
+      const maxAttempts = 8;
+      const pollInterval = 2000; // 2s between polls
+
+      const poll = async (): Promise<void> => {
+        await refreshSubscription();
+        // Remount PlanStatusCard to fetch fresh data
+        setPlanCardKey((k) => k + 1);
+        attempts++;
+        // Check if the plan was updated — re-poll if still free and attempts remain
+        if (attempts < maxAttempts) {
+          const { data } = await supabase
+            .from("subscriptions")
+            .select("plan")
+            .eq("user_id", user!.id)
+            .maybeSingle();
+          if (data?.plan === "free" && attempts < maxAttempts) {
+            await new Promise((r) => setTimeout(r, pollInterval));
+            return poll();
+          }
+        }
+      };
+
+      await poll();
+      toast.success("Payment confirmed! Your plan has been activated.");
+    } catch (err) {
+      console.error("[Dashboard] Post-checkout refresh error:", err);
+      toast.error("Could not refresh billing status — please reload the page.");
     } finally {
       setRefreshing(false);
     }
@@ -56,11 +79,13 @@ const Dashboard = () => {
   const handleRefreshBilling = async () => {
     setRefreshing(true);
     try {
+      await supabase.auth.refreshSession();
       await refreshSubscription();
       // Remount PlanStatusCard to fetch live data
       setPlanCardKey((k) => k + 1);
       toast.success("Billing status refreshed");
-    } catch {
+    } catch (err) {
+      console.error("[Dashboard] Manual billing refresh error:", err);
       toast.error("Could not refresh billing status");
     } finally {
       setRefreshing(false);

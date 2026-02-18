@@ -36,18 +36,23 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
     if (data) setProfile(data);
   };
 
-  const refreshSubscription = useCallback(async () => {
+  // Always read directly from DB — never rely on stale check-subscription edge function cache
+  const refreshSubscription = useCallback(async (currentUser?: User | null) => {
+    const uid = currentUser?.id ?? user?.id;
+    if (!uid) return;
     try {
-      const { data, error } = await supabase.functions.invoke("check-subscription");
-      if (!error && data?.plan) {
+      // Primary: read directly from subscriptions table for instant accuracy post-checkout
+      const { data } = await supabase
+        .from("subscriptions")
+        .select("plan, status")
+        .eq("user_id", uid)
+        .maybeSingle();
+
+      if (data?.plan) {
         setPlan(data.plan as SubscriptionPlan);
       }
-    } catch {
-      // Fall back to DB
-      if (user) {
-        const { data } = await supabase.from("subscriptions").select("plan").eq("user_id", user.id).eq("status", "active").maybeSingle();
-        if (data) setPlan(data.plan as SubscriptionPlan);
-      }
+    } catch (err) {
+      console.error("[useAuth] refreshSubscription error:", err);
     }
   }, [user]);
 
@@ -61,7 +66,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       if (session?.user) {
         setTimeout(() => {
           fetchProfile(session.user.id);
-          refreshSubscription();
+          refreshSubscription(session.user);
         }, 0);
       } else {
         setProfile(null);
@@ -76,8 +81,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       setUser(session?.user ?? null);
       if (session?.user) {
         await fetchProfile(session.user.id);
-        // Defer subscription check to avoid blocking
-        setTimeout(() => refreshSubscription(), 100);
+        await refreshSubscription(session.user);
       }
       setIsLoading(false);
     };
@@ -86,10 +90,10 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
     return () => { mounted = false; subscription.unsubscribe(); };
   }, []);
 
-  // Periodic subscription refresh
+  // Periodic subscription refresh every 60s to catch webhook-triggered updates
   useEffect(() => {
     if (!user) return;
-    const interval = setInterval(refreshSubscription, 60000);
+    const interval = setInterval(() => refreshSubscription(), 60000);
     return () => clearInterval(interval);
   }, [user, refreshSubscription]);
 
