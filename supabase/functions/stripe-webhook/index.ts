@@ -10,6 +10,12 @@ const corsHeaders = {
 const log = (step: string, details?: unknown) =>
   console.log(`[STRIPE-WEBHOOK] ${step}${details ? " - " + JSON.stringify(details) : ""}`);
 
+// Known price → plan mapping (must match Stripe products)
+const PRICE_TO_PLAN: Record<string, string> = {
+  "price_1T1fRGDHxEfwTYTRHsy1ncWk": "pro",
+  "price_1T1fRODHxEfwTYTRSpZ7Zr1W": "bundle",
+};
+
 serve(async (req) => {
   if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
 
@@ -19,117 +25,146 @@ serve(async (req) => {
   const webhookSecret = Deno.env.get("STRIPE_WEBHOOK_SECRET");
   const stripe = new Stripe(stripeKey, { apiVersion: "2025-08-27.basil" });
 
-  // Always use service role for all DB writes in webhook context
+  // Service role client bypasses RLS for all webhook DB writes
   const supabase = createClient(
     Deno.env.get("SUPABASE_URL") ?? "",
     Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "",
     { auth: { persistSession: false } }
   );
 
-  // Must read raw body BEFORE any json() call for signature verification
-  const body = await req.text();
-  const sig = req.headers.get("stripe-signature");
+  // Raw body must be read before any other parsing for signature verification
+  const rawBody = await req.text();
+  const signature = req.headers.get("stripe-signature");
 
   let event: Stripe.Event;
   try {
-    if (webhookSecret && sig) {
-      event = stripe.webhooks.constructEvent(body, sig, webhookSecret);
+    if (webhookSecret && signature) {
+      event = stripe.webhooks.constructEvent(rawBody, signature, webhookSecret);
     } else {
-      // Dev fallback: no signature check when secret not configured
-      event = JSON.parse(body) as Stripe.Event;
-      log("WARNING: No webhook secret configured, skipping signature verification");
+      // Dev fallback: skip signature verification if secret not configured
+      event = JSON.parse(rawBody) as Stripe.Event;
+      log("WARNING: No webhook secret, skipping signature verification");
     }
   } catch (err) {
     log("Signature verification failed", { error: (err as Error).message });
-    return new Response(JSON.stringify({ error: "Webhook signature verification failed" }), {
-      status: 400, headers: corsHeaders,
-    });
+    return new Response("Signature verification failed", { status: 400, headers: corsHeaders });
   }
 
   log("Event received", { id: event.id, type: event.type });
 
-  // Idempotency — insert event_id first; unique constraint returns 23505 on duplicate
+  // Idempotency: check if event was already processed before doing any work
+  const { data: existingEvent } = await supabase
+    .from("stripe_events")
+    .select("id, status")
+    .eq("event_id", event.id)
+    .maybeSingle();
+
+  if (existingEvent) {
+    log("Event already processed, skipping", { event_id: event.id, status: existingEvent.status });
+    return new Response(JSON.stringify({ received: true, skipped: true }), {
+      status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
+  }
+
+  // Insert event record immediately to claim idempotency slot
   const { error: insertError } = await supabase.from("stripe_events").insert({
     event_id: event.id,
     type: event.type,
     status: "processing",
+    customer_id: (event.data.object as any).customer ?? null,
   });
 
+  // If insert failed due to race condition unique constraint, skip
   if (insertError?.code === "23505") {
-    log("Event already processed, skipping", { event_id: event.id });
+    log("Race condition: event already inserted", { event_id: event.id });
     return new Response(JSON.stringify({ received: true, skipped: true }), {
-      status: 200, headers: corsHeaders,
+      status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
   }
 
-  try {
-    const obj = event.data.object as any;
-    const customerId = obj.customer as string | undefined;
+  const obj = event.data.object as any;
+  const customerId = obj.customer as string | undefined;
 
+  try {
     switch (event.type) {
+
       case "checkout.session.completed": {
         const session = obj as Stripe.Checkout.Session;
         const userId = session.metadata?.user_id;
-        const planId = (session.metadata?.plan_id || session.metadata?.plan) as string;
-        const priceId = session.metadata?.price_id;
+        const planId = session.metadata?.plan_id;
 
-        log("checkout.session.completed", { userId, planId, priceId });
+        log("checkout.session.completed", { userId, planId, customerId });
 
         if (!userId) {
-          console.error("[STRIPE-WEBHOOK] Missing user_id in metadata — cannot fulfill");
-          break;
+          console.error("[STRIPE-WEBHOOK] MISSING user_id in checkout metadata — cannot fulfill");
+          await supabase.from("stripe_events").update({ status: "error", error: "Missing user_id in metadata" }).eq("event_id", event.id);
+          // Return 200 so Stripe doesn't retry — this is a data contract error
+          return new Response(JSON.stringify({ received: true }), {
+            status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" },
+          });
         }
 
-        // Fetch full subscription details to get current_period_end
+        // Fetch full subscription details to get current_period_end timestamp
         let periodEnd: string | null = null;
+        let stripeSubId: string | null = session.subscription as string ?? null;
+
         if (session.subscription) {
-          const sub = await stripe.subscriptions.retrieve(session.subscription as string);
-          const ts = (sub as any).current_period_end;
-          periodEnd = ts ? new Date(ts * 1000).toISOString() : null;
+          try {
+            const sub = await stripe.subscriptions.retrieve(session.subscription as string);
+            const ts = (sub as any).current_period_end;
+            periodEnd = ts ? new Date(ts * 1000).toISOString() : null;
+          } catch (e) {
+            log("Could not retrieve subscription details", { error: (e as Error).message });
+          }
         }
 
-        await supabase.from("subscriptions").update({
+        // Update profile with plan and customer id
+        const { error: profileErr } = await supabase.from("profiles")
+          .update({ stripe_customer_id: customerId ?? null })
+          .eq("user_id", userId);
+        if (profileErr) log("Profile update error", { error: profileErr.message });
+
+        // Upsert subscription record — conflict on user_id
+        const { error: subErr } = await supabase.from("subscriptions").update({
           plan: planId as any,
           status: "active",
           stripe_customer_id: customerId ?? null,
-          stripe_subscription_id: (session.subscription as string) ?? null,
+          stripe_subscription_id: stripeSubId,
           current_period_end: periodEnd,
         }).eq("user_id", userId);
+        if (subErr) log("Subscription upsert error", { error: subErr.message });
 
-        log("Subscription fulfilled", { userId, planId, periodEnd });
+        log("checkout.session.completed fulfilled", { userId, planId, periodEnd });
         break;
       }
 
       case "customer.subscription.created":
       case "customer.subscription.updated": {
         const sub = obj as Stripe.Subscription;
+        const priceId = sub.items.data[0]?.price?.id;
+        // Resolve plan from price id, fallback to 'free' if unknown
+        const planId = priceId ? (PRICE_TO_PLAN[priceId] || "pro") : "pro";
         const ts = (sub as any).current_period_end;
-        const endDate = ts ? new Date(ts * 1000).toISOString() : null;
+        const periodEnd = ts ? new Date(ts * 1000).toISOString() : null;
 
-        // Resolve user_id via stripe_customer_id stored in DB
+        // Resolve user_id from stored stripe_customer_id
         const { data: subRow } = await supabase
           .from("subscriptions")
           .select("user_id")
           .eq("stripe_customer_id", customerId ?? "")
           .maybeSingle();
 
-        const userId = subRow?.user_id;
-        const productId = sub.items.data[0]?.price?.product as string | undefined;
+        // If no DB row yet (e.g. customer.subscription.created before checkout webhook), try checkout metadata
+        const userId = subRow?.user_id ?? obj.metadata?.user_id;
 
-        const PRODUCT_TO_PLAN: Record<string, string> = {
-          prod_TzekEm3i5ZcS6e: "pro",
-          prod_TzekhtWD8qlVi8: "bundle",
-        };
-        const plan = productId ? (PRODUCT_TO_PLAN[productId] || "pro") : "pro";
-
-        log(`${event.type}`, { userId, plan, endDate });
+        log(`${event.type}`, { userId, planId, periodEnd, priceId });
 
         if (userId) {
           await supabase.from("subscriptions").update({
-            plan: plan as any,
+            plan: planId as any,
             status: sub.status === "active" ? "active" : (sub.status as any),
             stripe_subscription_id: sub.id,
-            current_period_end: endDate,
+            current_period_end: periodEnd,
           }).eq("user_id", userId);
         }
         break;
@@ -145,16 +180,25 @@ serve(async (req) => {
           .maybeSingle();
 
         const userId = subRow?.user_id;
-        log("customer.subscription.deleted", { userId });
+        log("customer.subscription.deleted", { userId, currentPlan: subRow?.plan });
 
-        // Do not downgrade bundle — it's a lifetime purchase
-        if (userId && subRow?.plan !== "bundle") {
-          await supabase.from("subscriptions").update({
-            plan: "free",
-            status: "canceled",
-            stripe_subscription_id: null,
-            current_period_end: null,
-          }).eq("user_id", userId);
+        if (userId) {
+          // Bundle is a lifetime purchase — never downgrade it on subscription deletion
+          if (subRow?.plan !== "bundle") {
+            await supabase.from("subscriptions").update({
+              plan: "free",
+              status: "canceled",
+              stripe_subscription_id: null,
+              current_period_end: null,
+            }).eq("user_id", userId);
+            log("Downgraded to free", { userId });
+          } else {
+            // Just mark canceled without changing plan
+            await supabase.from("subscriptions").update({
+              status: "canceled",
+            }).eq("user_id", userId);
+            log("Bundle plan kept, status set to canceled", { userId });
+          }
         }
         break;
       }
@@ -164,13 +208,14 @@ serve(async (req) => {
         const subId = invoice.subscription as string | undefined;
 
         if (subId) {
+          // Use invoice period_end to update subscription renewal date
           const ts = (invoice as any).period_end;
           const endDate = ts ? new Date(ts * 1000).toISOString() : null;
           await supabase.from("subscriptions").update({
             status: "active",
             current_period_end: endDate,
           }).eq("stripe_subscription_id", subId);
-          log("invoice.paid", { subId, endDate });
+          log("invoice.paid — subscription renewed", { subId, endDate });
         }
         break;
       }
@@ -179,20 +224,27 @@ serve(async (req) => {
         log("Unhandled event type", { type: event.type });
     }
 
-    // Mark event processed successfully
+    // Mark event as successfully processed
     await supabase.from("stripe_events").update({
       status: "success",
       customer_id: customerId ?? null,
     }).eq("event_id", event.id);
 
-    return new Response(JSON.stringify({ received: true }), { status: 200, headers: corsHeaders });
+    return new Response(JSON.stringify({ received: true }), {
+      status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
+
   } catch (error) {
     const msg = (error as Error).message;
-    log("Handler error", { message: msg });
-    // Persist error for debug page visibility
+    console.error("[STRIPE-WEBHOOK] Handler error:", msg);
+    // Persist error for debug page visibility — still return 200 to prevent Stripe retries
     await supabase.from("stripe_events").update({
-      status: "error", error: msg,
+      status: "error",
+      error: msg,
     }).eq("event_id", event.id);
-    return new Response(JSON.stringify({ error: msg }), { status: 500, headers: corsHeaders });
+    // Return 200 to Stripe — retrying won't fix a code-level error
+    return new Response(JSON.stringify({ received: true, error: msg }), {
+      status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
   }
 });
