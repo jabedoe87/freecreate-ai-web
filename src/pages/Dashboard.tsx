@@ -1,9 +1,12 @@
+import { useEffect, useState } from "react";
 import { useAuth } from "@/hooks/useAuth";
 import { useUsage } from "@/hooks/useUsage";
 import { Button } from "@/components/ui/button";
-import { useNavigate } from "react-router-dom";
-import { LogOut, Sparkles, Crown, Plus, BookOpen, Layout, Zap } from "lucide-react";
+import { useNavigate, useSearchParams } from "react-router-dom";
+import { LogOut, Sparkles, Crown, Plus, BookOpen, Layout, RefreshCw } from "lucide-react";
 import PlanStatusCard from "@/components/PlanStatusCard";
+import UpgradeLimitModal from "@/components/UpgradeLimitModal";
+import { toast } from "sonner";
 
 const planLabels: Record<string, { label: string; icon: typeof Sparkles }> = {
   free: { label: "Free Plan", icon: Sparkles },
@@ -12,12 +15,36 @@ const planLabels: Record<string, { label: string; icon: typeof Sparkles }> = {
 };
 
 const Dashboard = () => {
-  const { user, profile, plan, signOut } = useAuth();
-  const { remaining, limit, canGenerate } = useUsage();
+  const { user, profile, plan, signOut, refreshSubscription } = useAuth();
+  const { canGenerate } = useUsage();
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [showUpgradeModal, setShowUpgradeModal] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
 
   const currentPlan = planLabels[plan] || planLabels.free;
   const PlanIcon = currentPlan.icon;
+
+  // Detect post-checkout redirect and refresh subscription state
+  useEffect(() => {
+    if (searchParams.get("checkout") === "success") {
+      // Remove param from URL so refresh doesn't re-trigger
+      setSearchParams({}, { replace: true });
+      handleRefreshBilling(true);
+    }
+  }, []);
+
+  const handleRefreshBilling = async (silent = false) => {
+    setRefreshing(true);
+    try {
+      await refreshSubscription();
+      if (!silent) toast.success("Billing status refreshed");
+    } catch {
+      if (!silent) toast.error("Could not refresh billing status");
+    } finally {
+      setRefreshing(false);
+    }
+  };
 
   const handleSignOut = async () => {
     await signOut();
@@ -47,12 +74,22 @@ const Dashboard = () => {
           <h1 className="text-3xl font-bold text-foreground">
             Welcome{profile?.display_name ? `, ${profile.display_name}` : ""}!
           </h1>
-        <p className="text-muted-foreground">Your AI-powered creative workspace.</p>
+          <p className="text-muted-foreground">Your AI-powered creative workspace.</p>
         </div>
 
-        {/* Plan status card replaces raw usage bar */}
-        <div className="mb-8">
+        {/* Plan status card + refresh billing button */}
+        <div className="mb-8 space-y-3">
           <PlanStatusCard />
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => handleRefreshBilling(false)}
+            disabled={refreshing}
+            className="text-muted-foreground"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 mr-1.5 ${refreshing ? "animate-spin" : ""}`} />
+            {refreshing ? "Refreshing…" : "Refresh Billing Status"}
+          </Button>
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
@@ -61,7 +98,17 @@ const Dashboard = () => {
               <Plus className="w-5 h-5 text-primary" /> Create Prompt
             </h3>
             <p className="text-sm text-muted-foreground">Start generating with AI prompt tools.</p>
-            <Button className="w-full" onClick={() => navigate("/create-prompt")}>
+            <Button
+              className="w-full"
+              onClick={() => {
+                // Gate at dashboard level for instant feedback
+                if (!canGenerate && plan === "free") {
+                  setShowUpgradeModal(true);
+                  return;
+                }
+                navigate("/create-prompt");
+              }}
+            >
               Create New
             </Button>
           </div>
@@ -115,6 +162,16 @@ const Dashboard = () => {
           </div>
         </div>
       </main>
+
+      {/* Upgrade limit modal mounted at dashboard level */}
+      <UpgradeLimitModal
+        isOpen={showUpgradeModal}
+        onClose={() => setShowUpgradeModal(false)}
+        onUpgrade={() => {
+          setShowUpgradeModal(false);
+          navigate("/upgrade");
+        }}
+      />
     </div>
   );
 };
