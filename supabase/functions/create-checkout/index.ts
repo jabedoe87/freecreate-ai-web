@@ -48,8 +48,8 @@ serve(async (req) => {
 
     const token = authHeader.replace("Bearer ", "");
 
-    // Pass auth header in global headers so getUser(token) validates against the auth server
-    // This works with both HS256 and ES256 (Lovable Cloud) signed JWTs
+    // Use getClaims() for local JWT validation — works with ES256 (Lovable Cloud) without
+    // making a network call to /user which requires a server-side session (causes 403).
     const supabaseClient = createClient(
       Deno.env.get("SUPABASE_URL") ?? "",
       Deno.env.get("SUPABASE_ANON_KEY") ?? "",
@@ -63,15 +63,26 @@ serve(async (req) => {
       { auth: { persistSession: false } }
     );
 
-    const { data: userData, error: userError } = await supabaseClient.auth.getUser(token);
-    if (userError || !userData.user?.email) {
-      console.error("[CREATE-CHECKOUT] getUser failed:", userError?.message);
+    const { data: claimsData, error: claimsError } = await supabaseClient.auth.getClaims(token);
+    if (claimsError || !claimsData?.claims) {
+      console.error("[CREATE-CHECKOUT] getClaims failed:", claimsError?.message);
       return new Response(JSON.stringify({ error: "Not authenticated" }), {
         headers: { ...corsHeaders, "Content-Type": "application/json" },
         status: 401,
       });
     }
-    const user = userData.user;
+
+    const userId: string = claimsData.claims.sub;
+    const userEmail: string | undefined = claimsData.claims.email as string | undefined;
+
+    if (!userEmail) {
+      return new Response(JSON.stringify({ error: "Not authenticated" }), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+        status: 401,
+      });
+    }
+
+    const user = { id: userId, email: userEmail };
 
     const body = await req.json();
     const planId: string = body.plan;
