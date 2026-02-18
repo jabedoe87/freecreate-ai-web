@@ -8,6 +8,7 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { toast } from "sonner";
 import { ArrowLeft, Sparkles, Zap } from "lucide-react";
+import UpgradeLimitModal from "@/components/UpgradeLimitModal";
 
 const CreatePrompt = () => {
   const { user, plan } = useAuth();
@@ -16,21 +17,23 @@ const CreatePrompt = () => {
   const [title, setTitle] = useState("");
   const [content, setContent] = useState("");
   const [saving, setSaving] = useState(false);
+  const [showUpgradeModal, setShowUpgradeModal] = useState(false);
 
   const handleSave = async () => {
     if (!title.trim() || !content.trim()) {
       toast.error("Please fill in both title and content");
       return;
     }
+    // Block generation and show paywall if free user is at limit
     if (!canGenerate) {
-      toast.error("You've reached your monthly limit. Upgrade to continue!");
+      setShowUpgradeModal(true);
       return;
     }
     setSaving(true);
     try {
       const success = await incrementUsage();
       if (!success) {
-        toast.error("Usage limit reached. Upgrade your plan!");
+        setShowUpgradeModal(true);
         return;
       }
       const { error } = await supabase.from("user_prompts").insert({
@@ -74,11 +77,11 @@ const CreatePrompt = () => {
           </p>
         </div>
 
-        {!canGenerate && (
+        {!canGenerate && plan === "free" && (
           <div className="bg-destructive/10 border border-destructive/30 rounded-xl p-4 mb-6">
             <p className="text-sm text-destructive font-medium">
               You've used all {limit} generations this month.{" "}
-              <button onClick={() => navigate("/upgrade")} className="underline font-bold">
+              <button onClick={() => setShowUpgradeModal(true)} className="underline font-bold">
                 Upgrade now
               </button>{" "}
               for unlimited access.
@@ -106,7 +109,7 @@ const CreatePrompt = () => {
             />
           </div>
           <div className="flex gap-3">
-            <Button onClick={handleSave} disabled={saving || !canGenerate} className="flex-1">
+            <Button onClick={handleSave} disabled={saving} className="flex-1">
               {saving ? "Saving..." : "Save Prompt"}
             </Button>
             <Button variant="outline" onClick={() => navigate("/dashboard")}>
@@ -115,6 +118,15 @@ const CreatePrompt = () => {
           </div>
         </div>
       </main>
+
+      <UpgradeLimitModal
+        isOpen={showUpgradeModal}
+        onClose={() => setShowUpgradeModal(false)}
+        onUpgrade={() => {
+          setShowUpgradeModal(false);
+          navigate("/upgrade");
+        }}
+      />
     </div>
   );
 };

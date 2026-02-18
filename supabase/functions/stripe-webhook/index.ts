@@ -19,12 +19,14 @@ serve(async (req) => {
   const webhookSecret = Deno.env.get("STRIPE_WEBHOOK_SECRET");
   const stripe = new Stripe(stripeKey, { apiVersion: "2025-08-27.basil" });
 
+  // Always use service role for all DB writes in webhook context
   const supabase = createClient(
     Deno.env.get("SUPABASE_URL") ?? "",
     Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "",
     { auth: { persistSession: false } }
   );
 
+  // Must read raw body BEFORE any json() call for signature verification
   const body = await req.text();
   const sig = req.headers.get("stripe-signature");
 
@@ -33,28 +35,31 @@ serve(async (req) => {
     if (webhookSecret && sig) {
       event = stripe.webhooks.constructEvent(body, sig, webhookSecret);
     } else {
-      // Allow unsigned events in dev (no webhook secret configured)
+      // Dev fallback: no signature check when secret not configured
       event = JSON.parse(body) as Stripe.Event;
       log("WARNING: No webhook secret configured, skipping signature verification");
     }
   } catch (err) {
     log("Signature verification failed", { error: (err as Error).message });
-    return new Response(JSON.stringify({ error: "Invalid signature" }), { status: 400, headers: corsHeaders });
+    return new Response(JSON.stringify({ error: "Webhook signature verification failed" }), {
+      status: 400, headers: corsHeaders,
+    });
   }
 
   log("Event received", { id: event.id, type: event.type });
 
-  // Idempotency check — insert event_id first
+  // Idempotency — insert event_id first; unique constraint returns 23505 on duplicate
   const { error: insertError } = await supabase.from("stripe_events").insert({
     event_id: event.id,
     type: event.type,
-    status: "pending",
+    status: "processing",
   });
 
   if (insertError?.code === "23505") {
-    // Unique violation = already processed
     log("Event already processed, skipping", { event_id: event.id });
-    return new Response(JSON.stringify({ received: true, skipped: true }), { status: 200, headers: corsHeaders });
+    return new Response(JSON.stringify({ received: true, skipped: true }), {
+      status: 200, headers: corsHeaders,
+    });
   }
 
   try {
@@ -65,30 +70,43 @@ serve(async (req) => {
       case "checkout.session.completed": {
         const session = obj as Stripe.Checkout.Session;
         const userId = session.metadata?.user_id;
-        const plan = (session.metadata?.plan_id || session.metadata?.plan) as string;
+        const planId = (session.metadata?.plan_id || session.metadata?.plan) as string;
         const priceId = session.metadata?.price_id;
 
-        log("checkout.session.completed", { userId, plan, priceId });
+        log("checkout.session.completed", { userId, planId, priceId });
 
-        if (userId && plan) {
-          // Update subscription in DB
-          await supabase.from("subscriptions").update({
-            plan: plan as any,
-            status: "active",
-            stripe_customer_id: customerId ?? null,
-            stripe_subscription_id: (session.subscription as string) ?? null,
-          }).eq("user_id", userId);
+        if (!userId) {
+          console.error("[STRIPE-WEBHOOK] Missing user_id in metadata — cannot fulfill");
+          break;
         }
+
+        // Fetch full subscription details to get current_period_end
+        let periodEnd: string | null = null;
+        if (session.subscription) {
+          const sub = await stripe.subscriptions.retrieve(session.subscription as string);
+          const ts = (sub as any).current_period_end;
+          periodEnd = ts ? new Date(ts * 1000).toISOString() : null;
+        }
+
+        await supabase.from("subscriptions").update({
+          plan: planId as any,
+          status: "active",
+          stripe_customer_id: customerId ?? null,
+          stripe_subscription_id: (session.subscription as string) ?? null,
+          current_period_end: periodEnd,
+        }).eq("user_id", userId);
+
+        log("Subscription fulfilled", { userId, planId, periodEnd });
         break;
       }
 
       case "customer.subscription.created":
       case "customer.subscription.updated": {
         const sub = obj as Stripe.Subscription;
-        const periodEnd = (sub as any).current_period_end;
-        const endDate = periodEnd ? new Date(periodEnd * 1000).toISOString() : null;
+        const ts = (sub as any).current_period_end;
+        const endDate = ts ? new Date(ts * 1000).toISOString() : null;
 
-        // Resolve user_id from stripe_customer_id
+        // Resolve user_id via stripe_customer_id stored in DB
         const { data: subRow } = await supabase
           .from("subscriptions")
           .select("user_id")
@@ -127,11 +145,10 @@ serve(async (req) => {
           .maybeSingle();
 
         const userId = subRow?.user_id;
-
         log("customer.subscription.deleted", { userId });
 
+        // Do not downgrade bundle — it's a lifetime purchase
         if (userId && subRow?.plan !== "bundle") {
-          // Downgrade to free unless lifetime bundle
           await supabase.from("subscriptions").update({
             plan: "free",
             status: "canceled",
@@ -147,8 +164,8 @@ serve(async (req) => {
         const subId = invoice.subscription as string | undefined;
 
         if (subId) {
-          const periodEnd = (invoice as any).period_end;
-          const endDate = periodEnd ? new Date(periodEnd * 1000).toISOString() : null;
+          const ts = (invoice as any).period_end;
+          const endDate = ts ? new Date(ts * 1000).toISOString() : null;
           await supabase.from("subscriptions").update({
             status: "active",
             current_period_end: endDate,
@@ -162,7 +179,7 @@ serve(async (req) => {
         log("Unhandled event type", { type: event.type });
     }
 
-    // Mark event as success
+    // Mark event processed successfully
     await supabase.from("stripe_events").update({
       status: "success",
       customer_id: customerId ?? null,
@@ -172,7 +189,10 @@ serve(async (req) => {
   } catch (error) {
     const msg = (error as Error).message;
     log("Handler error", { message: msg });
-    await supabase.from("stripe_events").update({ status: "error", error: msg }).eq("event_id", event.id);
+    // Persist error for debug page visibility
+    await supabase.from("stripe_events").update({
+      status: "error", error: msg,
+    }).eq("event_id", event.id);
     return new Response(JSON.stringify({ error: msg }), { status: 500, headers: corsHeaders });
   }
 });
