@@ -6,6 +6,10 @@ import { toast } from "sonner";
 import { supabase } from "@/integrations/supabase/client";
 import { useState, useEffect } from "react";
 
+// Price IDs must match Stripe dashboard — driven by env vars, never hardcoded
+const STRIPE_PRICE_PRO = import.meta.env.VITE_STRIPE_PRICE_PRO as string | undefined;
+const STRIPE_PRICE_BUNDLE = import.meta.env.VITE_STRIPE_PRICE_BUNDLE as string | undefined;
+
 const plans = [
   {
     id: "free",
@@ -52,11 +56,18 @@ const Upgrade = () => {
   }, [searchParams]);
 
   const handleUpgrade = async (planId: string) => {
-    if (planId === "free" || planId === plan) return;
+    if (planId === "free") return;
+    // Allow bundle purchase even if user is already pro
+    if (planId === plan && planId !== "bundle") return;
     setLoadingPlan(planId);
+
+    // Resolve the price_id from env vars — falls back to undefined if not set
+    const priceId = planId === "pro" ? STRIPE_PRICE_PRO : planId === "bundle" ? STRIPE_PRICE_BUNDLE : undefined;
+
     try {
       const { data, error } = await supabase.functions.invoke("create-checkout", {
-        body: { plan: planId },
+        // Send both plan_id and price_id; server validates price_id against env var
+        body: { plan_id: planId, plan: planId, price_id: priceId },
       });
       if (error) throw error;
       if (data?.url) {
@@ -124,11 +135,12 @@ const Upgrade = () => {
                 <Button
                   className="w-full"
                   variant={p.highlight ? "default" : "outline"}
-                  disabled={isCurrent || p.id === "free" || isLoading}
+                  // Bundle is always purchasable (upgrade from free OR pro); free CTA is never clickable
+                  disabled={(isCurrent && p.id !== "bundle") || p.id === "free" || isLoading}
                   onClick={() => handleUpgrade(p.id)}
                 >
                   {isLoading ? <Loader2 className="w-4 h-4 animate-spin mr-2" /> : null}
-                  {isCurrent ? "Current Plan" : p.cta}
+                  {isCurrent && p.id !== "bundle" ? "Current Plan" : p.cta}
                 </Button>
               </div>
             );
