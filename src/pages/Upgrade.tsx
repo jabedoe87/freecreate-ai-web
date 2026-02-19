@@ -66,8 +66,8 @@ const Upgrade = () => {
 
     try {
       const { data, error } = await supabase.functions.invoke("create-checkout", {
-        // Send both plan_id and price_id; server validates price_id against env var
-        body: { plan_id: planId, plan: planId, price_id: priceId },
+        // Only send plan_id — backend resolves price from secrets, no frontend price_id needed
+        body: { plan_id: planId, plan: planId },
       });
       if (error) throw error;
       if (data?.url) {
