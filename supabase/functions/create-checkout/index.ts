@@ -8,181 +8,112 @@ const corsHeaders = {
     "authorization, x-client-info, apikey, content-type, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version",
 };
 
-function jsonResponse(body: Record<string, unknown>, status: number) {
+function json(body: Record<string, unknown>, status = 200) {
   return new Response(JSON.stringify(body), {
     status,
     headers: { ...corsHeaders, "Content-Type": "application/json" },
   });
 }
 
-/** Decode JWT payload without verification (verify_jwt=false in config.toml). */
-function decodeJwtPayload(token: string): Record<string, unknown> | null {
-  try {
-    const parts = token.split(".");
-    if (parts.length !== 3) return null;
-    const base64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
-    const padded = base64.padEnd(base64.length + (4 - (base64.length % 4)) % 4, "=");
-    return JSON.parse(atob(padded));
-  } catch {
-    return null;
-  }
-}
-
 serve(async (req) => {
-  // ── CORS preflight ──
   if (req.method === "OPTIONS") {
     return new Response(null, { headers: corsHeaders, status: 204 });
   }
 
-  const origin = req.headers.get("origin") ?? "(none)";
-  const hasAuth = !!req.headers.get("Authorization");
-  console.log(`[CREATE-CHECKOUT] ${req.method} origin=${origin} hasAuth=${hasAuth}`);
-
+  const log: Record<string, unknown> = { step: "REQUEST_RECEIVED", method: req.method };
   try {
-    // ── Env validation ──
-    const stripeKey = Deno.env.get("STRIPE_SECRET_KEY");
-    if (!stripeKey) return jsonResponse({ ok: false, code: "SERVER_CONFIG", message: "STRIPE_SECRET_KEY missing" }, 500);
+    // Step 1: Log request basics
+    log.origin = req.headers.get("origin") ?? "(none)";
+    log.hasAuth = !!req.headers.get("Authorization");
+    console.log(JSON.stringify(log));
 
-    const PRICE_MAP: Record<string, { envKey: string; mode: "subscription" | "payment"; name: string; amount: number; interval?: "month" }> = {
-      pro:    { envKey: "STRIPE_PRICE_PRO",    mode: "subscription", name: "Pro Plan",  amount: 1900, interval: "month" },
-      bundle: { envKey: "STRIPE_PRICE_BUNDLE",  mode: "payment",      name: "Bundle",    amount: 4900 },
-    };
-
-    // ── Auth ──
+    // Step 2: Auth
     const authHeader = req.headers.get("Authorization");
     if (!authHeader?.startsWith("Bearer ")) {
-      console.error("[CREATE-CHECKOUT] Missing or malformed Authorization header");
-      return jsonResponse({ ok: false, code: "NO_AUTH", message: "Authorization header missing" }, 401);
+      console.error(JSON.stringify({ step: "NO_AUTH", reason: "Missing Bearer token" }));
+      return json({ ok: false, step: "NO_AUTH", error: "Authorization header missing" }, 401);
     }
 
-    const token = authHeader.replace("Bearer ", "").trim();
-    const claims = decodeJwtPayload(token);
-    if (!claims?.sub) {
-      console.error("[CREATE-CHECKOUT] JWT decode failed");
-      return jsonResponse({ ok: false, code: "NO_AUTH", message: "Invalid token" }, 401);
-    }
-    if (typeof claims.exp === "number" && claims.exp < Math.floor(Date.now() / 1000)) {
-      console.error("[CREATE-CHECKOUT] JWT expired");
-      return jsonResponse({ ok: false, code: "NO_AUTH", message: "Token expired" }, 401);
+    const token = authHeader.replace("Bearer ", "");
+    const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
+    const supabaseAnonKey = Deno.env.get("SUPABASE_ANON_KEY") ?? "";
+
+    console.log(JSON.stringify({ step: "SUPABASE_CLIENT_INIT", hasUrl: !!supabaseUrl, hasAnon: !!supabaseAnonKey }));
+
+    const supabase = createClient(supabaseUrl, supabaseAnonKey, {
+      global: { headers: { Authorization: authHeader } },
+    });
+
+    const { data: authData, error: authError } = await supabase.auth.getUser(token);
+    if (authError || !authData?.user) {
+      console.error(JSON.stringify({ step: "AUTH_FAILED", error: authError?.message ?? "No user" }));
+      return json({ ok: false, step: "AUTH_FAILED", error: authError?.message ?? "Invalid token" }, 401);
     }
 
-    const userId = claims.sub as string;
-    const userEmail = (claims.email ?? claims.user_email) as string | undefined;
-    if (!userEmail) {
-      console.error("[CREATE-CHECKOUT] No email in JWT");
-      return jsonResponse({ ok: false, code: "NO_AUTH", message: "No email in token" }, 401);
-    }
-    console.log(`[CREATE-CHECKOUT] user=${userId} email=${userEmail}`);
+    const user = authData.user;
+    console.log(JSON.stringify({ step: "AUTH_SUCCESS", userId: user.id, email: user.email }));
 
-    // ── Parse body ──
+    // Step 3: Parse body
     let body: Record<string, unknown>;
     try {
       body = await req.json();
-    } catch {
-      return jsonResponse({ ok: false, code: "BAD_INPUT", message: "Invalid JSON body" }, 400);
+    } catch (e) {
+      console.error(JSON.stringify({ step: "BODY_PARSE_FAILED", error: (e as Error).message }));
+      return json({ ok: false, step: "BAD_INPUT", error: "Invalid JSON body" }, 400);
     }
 
-    const planId = (body.plan_id ?? body.plan) as string | undefined;
-    if (!planId || !PRICE_MAP[planId]) {
-      console.error(`[CREATE-CHECKOUT] Invalid plan: ${planId}`);
-      return jsonResponse({ ok: false, code: "BAD_INPUT", message: `Invalid plan. Must be one of: ${Object.keys(PRICE_MAP).join(", ")}` }, 400);
-    }
-    const planCfg = PRICE_MAP[planId];
-    console.log(`[CREATE-CHECKOUT] plan=${planId} mode=${planCfg.mode}`);
+    const plan = (body.plan ?? body.plan_id) as string | undefined;
+    console.log(JSON.stringify({ step: "INPUT_VALIDATION", plan }));
 
-    // ── Resolve price ID from env ──
-    let priceId = Deno.env.get(planCfg.envKey) ?? "";
-    if (!priceId) {
-      console.error(`[CREATE-CHECKOUT] ${planCfg.envKey} env var is empty`);
-      return jsonResponse({ ok: false, code: "SERVER_CONFIG", message: `${planCfg.envKey} not configured` }, 500);
+    if (!plan || !["pro", "bundle"].includes(plan)) {
+      return json({ ok: false, step: "BAD_INPUT", error: `Invalid plan: ${plan}` }, 400);
     }
 
-    // ── Init Stripe ──
+    // Step 4: Stripe init
+    const stripeKey = Deno.env.get("STRIPE_SECRET_KEY");
+    if (!stripeKey) {
+      console.error(JSON.stringify({ step: "STRIPE_KEY_MISSING" }));
+      return json({ ok: false, step: "SERVER_CONFIG", error: "STRIPE_SECRET_KEY missing" }, 500);
+    }
     const stripe = new Stripe(stripeKey, { apiVersion: "2025-08-27.basil" });
+    console.log(JSON.stringify({ step: "STRIPE_CLIENT_CREATED" }));
 
-    // ── Validate price exists in Stripe ──
-    try {
-      const price = await stripe.prices.retrieve(priceId);
-      console.log(`[CREATE-CHECKOUT] Price ${priceId} verified (active=${price.active})`);
-      if (!price.active) {
-        console.error(`[CREATE-CHECKOUT] Price ${priceId} is inactive`);
-        return jsonResponse({ ok: false, code: "STRIPE_ERROR", message: "Price is inactive in Stripe" }, 500);
-      }
-    } catch (err: unknown) {
-      const stripeErr = err as { code?: string; message?: string };
-      if (stripeErr.code === "resource_missing") {
-        console.error(`[CREATE-CHECKOUT] Price ${priceId} not found in Stripe — attempting self-heal`);
-        try {
-          const product = await stripe.products.create({ name: planCfg.name });
-          const newPriceParams: Stripe.PriceCreateParams = {
-            unit_amount: planCfg.amount,
-            currency: "eur",
-            product: product.id,
-          };
-          if (planCfg.interval) {
-            newPriceParams.recurring = { interval: planCfg.interval };
-          }
-          const newPrice = await stripe.prices.create(newPriceParams);
-          console.log(`[CREATE-CHECKOUT] Self-healed: created price ${newPrice.id} for ${planId}`);
-          return jsonResponse({
-            ok: false,
-            code: "PRICE_MISSING_CREATED",
-            message: `Price was missing. Created new price ${newPrice.id}. Update ${planCfg.envKey} secret to this value.`,
-            newPriceId: newPrice.id,
-          }, 500);
-        } catch (healErr: unknown) {
-          console.error("[CREATE-CHECKOUT] Self-heal failed:", (healErr as Error).message);
-          return jsonResponse({ ok: false, code: "STRIPE_ERROR", message: "Price missing and auto-create failed" }, 500);
-        }
-      }
-      console.error(`[CREATE-CHECKOUT] Stripe price retrieve error:`, stripeErr.message);
-      return jsonResponse({ ok: false, code: "STRIPE_ERROR", message: stripeErr.message ?? "Stripe error" }, 500);
+    // Step 5: Resolve price
+    const priceId = plan === "pro"
+      ? Deno.env.get("STRIPE_PRICE_PRO") ?? ""
+      : Deno.env.get("STRIPE_PRICE_BUNDLE") ?? "";
+
+    console.log(JSON.stringify({ step: "PRICE_ID_RESOLVED", plan, priceId }));
+
+    if (!priceId) {
+      return json({ ok: false, step: "SERVER_CONFIG", error: `Price env var empty for ${plan}` }, 500);
     }
 
-    // ── Resolve or create Stripe customer ──
-    const supabaseAdmin = createClient(
-      Deno.env.get("SUPABASE_URL") ?? "",
-      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "",
-      { auth: { persistSession: false } },
-    );
-
-    const { data: subRow } = await supabaseAdmin
-      .from("subscriptions")
-      .select("stripe_customer_id")
-      .eq("user_id", userId)
-      .maybeSingle();
-
-    let customerId: string | undefined = subRow?.stripe_customer_id ?? undefined;
-    if (!customerId) {
-      const customers = await stripe.customers.list({ email: userEmail, limit: 1 });
-      if (customers.data.length > 0) customerId = customers.data[0].id;
-    }
-
-    // ── Create checkout session ──
-    const appOrigin = req.headers.get("origin") || "https://freecreate-ai-web.lovable.app";
+    // Step 6: Create checkout session
+    const origin = req.headers.get("origin") || "https://freecreate-ai-web.lovable.app";
+    const mode = plan === "pro" ? "subscription" : "payment";
 
     const sessionParams: Stripe.Checkout.SessionCreateParams = {
-      mode: planCfg.mode,
+      mode: mode as "subscription" | "payment",
       line_items: [{ price: priceId, quantity: 1 }],
-      metadata: { user_id: userId, plan_id: planId, price_id: priceId },
-      client_reference_id: userId,
-      success_url: `${appOrigin}/dashboard?checkout=success`,
-      cancel_url: `${appOrigin}/upgrade`,
+      metadata: { user_id: user.id, plan_id: plan },
+      client_reference_id: user.id,
+      customer_email: user.email ?? undefined,
+      success_url: `${origin}/dashboard?checkout=success`,
+      cancel_url: `${origin}/upgrade`,
     };
 
-    if (customerId) {
-      sessionParams.customer = customerId;
-    } else {
-      sessionParams.customer_email = userEmail;
-    }
+    console.log(JSON.stringify({ step: "STRIPE_SESSION_CREATE_ATTEMPT", mode, priceId }));
 
     const session = await stripe.checkout.sessions.create(sessionParams);
-    console.log(`[CREATE-CHECKOUT] ✅ Session ${session.id} created for ${planId} (${planCfg.mode})`);
+    console.log(JSON.stringify({ step: "STRIPE_SESSION_CREATED", sessionId: session.id, url: session.url }));
 
-    return jsonResponse({ ok: true, url: session.url }, 200);
+    return json({ ok: true, step: "checkout_created", url: session.url }, 200);
+
   } catch (error: unknown) {
     const msg = (error as Error).message ?? "Unknown error";
-    console.error("[CREATE-CHECKOUT] Uncaught error:", msg);
-    return jsonResponse({ ok: false, code: "INTERNAL_ERROR", message: msg }, 500);
+    const stack = (error as Error).stack ?? "";
+    console.error(JSON.stringify({ step: "UNEXPECTED_ERROR", error: msg, stack }));
+    return json({ ok: false, step: "UNEXPECTED_ERROR", error: msg }, 500);
   }
 });
