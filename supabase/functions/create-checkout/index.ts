@@ -7,31 +7,26 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version",
 };
 
-// Canonical plan config — price IDs must match Stripe dashboard
-const PLANS: Record<string, { price_id: string; product_id: string; mode: "subscription" | "payment" }> = {
+// Price → mode mapping driven entirely by env vars — no hardcoded IDs
+const getPlanConfig = (): Record<string, { price_id: string; mode: "subscription" | "payment" }> => ({
   pro: {
-    price_id: "price_1T1fRGDHxEfwTYTRHsy1ncWk",
-    product_id: "prod_TzekEm3i5ZcS6e",
+    price_id: Deno.env.get("STRIPE_PRICE_PRO") ?? "",
     mode: "subscription",
   },
   bundle: {
-    price_id: "price_1T1fRODHxEfwTYTRSpZ7Zr1W",
-    product_id: "prod_TzekhtWD8qlVi8",
-    mode: "payment",
+    price_id: Deno.env.get("STRIPE_PRICE_BUNDLE") ?? "",
+    mode: "payment", // Lifetime one-time purchase — never subscription
   },
-};
+});
 
-const VALID_PRICE_IDS = new Set(Object.values(PLANS).map((p) => p.price_id));
-
-/** Decode JWT payload without verifying signature. Safe here because:
- *  1. verify_jwt = false means Supabase already stripped tampered requests upstream.
- *  2. We only use sub/email for DB lookups — no privilege escalation possible.
+/** Decode JWT payload without verifying signature. Safe because:
+ *  1. verify_jwt = false means Supabase strips tampered requests upstream.
+ *  2. We only use sub/email for lookups — no privilege escalation possible.
  */
 function decodeJwtPayload(token: string): Record<string, unknown> | null {
   try {
     const parts = token.split(".");
     if (parts.length !== 3) return null;
-    // Base64url → base64 → decode
     const base64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
     const padded = base64.padEnd(base64.length + (4 - (base64.length % 4)) % 4, "=");
     const json = atob(padded);
@@ -66,8 +61,7 @@ serve(async (req) => {
 
     const token = authHeader.replace("Bearer ", "").trim();
 
-    // Decode JWT payload locally — avoids network call to auth server which requires
-    // a server-side session and fails with ES256/RS256 tokens from Lovable Cloud.
+    // Local JWT decode — avoids network call to auth server that fails with ES256 tokens
     const claims = decodeJwtPayload(token);
     if (!claims || !claims.sub) {
       console.error("[CREATE-CHECKOUT] JWT decode failed or missing sub claim");
@@ -77,7 +71,7 @@ serve(async (req) => {
       });
     }
 
-    // Reject expired tokens
+    // Reject expired tokens before doing any DB/Stripe work
     if (typeof claims.exp === "number" && claims.exp < Math.floor(Date.now() / 1000)) {
       console.error("[CREATE-CHECKOUT] JWT expired");
       return new Response(JSON.stringify({ error: "Not authenticated" }), {
@@ -99,7 +93,7 @@ serve(async (req) => {
 
     console.log("[CREATE-CHECKOUT] User authenticated", { userId });
 
-    // Service role client for DB reads that bypass RLS
+    // Service role client bypasses RLS for reading existing customer IDs
     const supabaseAdmin = createClient(
       Deno.env.get("SUPABASE_URL") ?? "",
       Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "",
@@ -107,19 +101,32 @@ serve(async (req) => {
     );
 
     const body = await req.json();
-    const planId: string = body.plan;
+    const planId: string = body.plan_id ?? body.plan; // accept both shapes for backwards compat
+    const requestedPriceId: string | undefined = body.price_id;
+
+    const PLANS = getPlanConfig();
     const planConfig = PLANS[planId];
 
-    if (!planConfig || !VALID_PRICE_IDS.has(planConfig.price_id)) {
+    if (!planConfig || !planConfig.price_id) {
+      return new Response(JSON.stringify({ error: "Invalid plan" }), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+        status: 400,
+      });
+    }
+
+    // Validate price_id against the env-var value to prevent forged price substitution
+    if (requestedPriceId && requestedPriceId !== planConfig.price_id) {
+      console.error("[CREATE-CHECKOUT] price_id mismatch", { requestedPriceId, expected: planConfig.price_id });
       return new Response(JSON.stringify({ error: "Invalid price" }), {
         headers: { ...corsHeaders, "Content-Type": "application/json" },
         status: 400,
       });
     }
 
+    const priceId = planConfig.price_id;
     const stripe = new Stripe(stripeKey, { apiVersion: "2025-08-27.basil" });
 
-    // Try to reuse existing Stripe customer
+    // Try to reuse existing Stripe customer to avoid duplicates
     const { data: subRow } = await supabaseAdmin
       .from("subscriptions")
       .select("stripe_customer_id")
@@ -128,6 +135,7 @@ serve(async (req) => {
 
     let customerId: string | undefined = subRow?.stripe_customer_id ?? undefined;
 
+    // Email fallback in case DB row exists but customer_id not yet stored
     if (!customerId) {
       const customers = await stripe.customers.list({ email: userEmail, limit: 1 });
       if (customers.data.length > 0) {
@@ -139,17 +147,19 @@ serve(async (req) => {
 
     const sessionParams: Stripe.Checkout.SessionCreateParams = {
       mode: planConfig.mode,
-      line_items: [{ price: planConfig.price_id, quantity: 1 }],
-      success_url: `${origin}/dashboard?checkout=success`,
-      cancel_url: `${origin}/upgrade?checkout=cancelled`,
+      line_items: [{ price: priceId, quantity: 1 }],
+      // Metadata contract: user_id and plan_id MUST be present for webhook fulfillment
       metadata: {
         user_id: userId,
         plan_id: planId,
-        price_id: planConfig.price_id,
+        price_id: priceId,
       },
       client_reference_id: userId,
+      success_url: `${origin}/dashboard?checkout=success`,
+      cancel_url: `${origin}/upgrade`,
     };
 
+    // Attach existing customer if found; otherwise let Stripe collect email at checkout
     if (customerId) {
       sessionParams.customer = customerId;
     } else {
@@ -157,7 +167,7 @@ serve(async (req) => {
     }
 
     const session = await stripe.checkout.sessions.create(sessionParams);
-    console.log(`[CREATE-CHECKOUT] Session created for user ${userId}, plan ${planId}, session ${session.id}`);
+    console.log(`[CREATE-CHECKOUT] Session created for user ${userId}, plan ${planId} (${planConfig.mode}), session ${session.id}`);
 
     return new Response(JSON.stringify({ url: session.url }), {
       headers: { ...corsHeaders, "Content-Type": "application/json" },
