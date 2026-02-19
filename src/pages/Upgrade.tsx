@@ -6,9 +6,7 @@ import { toast } from "sonner";
 import { supabase } from "@/integrations/supabase/client";
 import { useState, useEffect } from "react";
 
-// Price IDs must match Stripe dashboard — driven by env vars, never hardcoded
-const STRIPE_PRICE_PRO = import.meta.env.VITE_STRIPE_PRICE_PRO as string | undefined;
-const STRIPE_PRICE_BUNDLE = import.meta.env.VITE_STRIPE_PRICE_BUNDLE as string | undefined;
+// Price IDs are resolved server-side from secrets — no frontend env vars needed
 
 const plans = [
   {
@@ -61,19 +59,28 @@ const Upgrade = () => {
     if (planId === plan && planId !== "bundle") return;
     setLoadingPlan(planId);
 
-    // Resolve the price_id from env vars — falls back to undefined if not set
-    const priceId = planId === "pro" ? STRIPE_PRICE_PRO : planId === "bundle" ? STRIPE_PRICE_BUNDLE : undefined;
-
     try {
       const { data, error } = await supabase.functions.invoke("create-checkout", {
-        // Only send plan_id — backend resolves price from secrets, no frontend price_id needed
-        body: { plan_id: planId, plan: planId },
+        body: { plan: planId },
       });
-      if (error) throw error;
+
+      // supabase-js wraps non-2xx as an error with context in data
+      if (error) {
+        // If the edge function returned a JSON body, it's in `data`
+        const code = data?.code ?? "UNKNOWN";
+        const msg = data?.message ?? error.message ?? "Checkout failed";
+        console.error("[Upgrade] checkout error", { code, msg, data });
+        toast.error(`${code}: ${msg}`);
+        return;
+      }
+
       if (data?.url) {
-        window.open(data.url, "_blank");
+        window.location.href = data.url;
+      } else {
+        toast.error("No checkout URL returned");
       }
     } catch (err: any) {
+      console.error("[Upgrade] unexpected error", err);
       toast.error(err.message || "Failed to start checkout");
     } finally {
       setLoadingPlan(null);
