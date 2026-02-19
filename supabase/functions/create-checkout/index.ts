@@ -78,8 +78,8 @@ serve(async (req) => {
     const stripe = new Stripe(stripeKey, { apiVersion: "2025-08-27.basil" });
     console.log(JSON.stringify({ step: "STRIPE_CLIENT_CREATED" }));
 
-    // Step 5: Resolve price
-    const priceId = plan === "pro"
+    // Step 5: Resolve price (with self-heal)
+    let priceId = plan === "pro"
       ? Deno.env.get("STRIPE_PRICE_PRO") ?? ""
       : Deno.env.get("STRIPE_PRICE_BUNDLE") ?? "";
 
@@ -87,6 +87,42 @@ serve(async (req) => {
 
     if (!priceId) {
       return json({ ok: false, step: "SERVER_CONFIG", error: `Price env var empty for ${plan}` }, 500);
+    }
+
+    // Verify price exists in Stripe; self-heal if missing
+    try {
+      await stripe.prices.retrieve(priceId);
+      console.log(JSON.stringify({ step: "PRICE_VERIFIED", priceId }));
+    } catch (priceErr: unknown) {
+      const priceErrMsg = (priceErr as Error).message ?? "";
+      if (priceErrMsg.includes("No such price")) {
+        console.log(JSON.stringify({ step: "PRICE_MISSING_SELF_HEALING", plan, oldPriceId: priceId }));
+        try {
+          // Create the missing product + price automatically
+          const productName = plan === "pro" ? "FreeCreate Pro" : "FreeCreate Bundle";
+          const product = await stripe.products.create({ name: productName });
+          console.log(JSON.stringify({ step: "PRODUCT_CREATED", productId: product.id }));
+
+          const priceParams: Stripe.PriceCreateParams = {
+            product: product.id,
+            currency: "eur",
+            unit_amount: plan === "pro" ? 1900 : 4900,
+          };
+          if (plan === "pro") {
+            priceParams.recurring = { interval: "month" };
+          }
+          const newPrice = await stripe.prices.create(priceParams);
+          priceId = newPrice.id;
+          console.log(JSON.stringify({ step: "PRICE_CREATED", newPriceId: priceId }));
+        } catch (createErr: unknown) {
+          const createMsg = (createErr as Error).message ?? "Unknown";
+          console.error(JSON.stringify({ step: "SELF_HEAL_FAILED", error: createMsg }));
+          return json({ ok: false, step: "SELF_HEAL_FAILED", error: createMsg }, 500);
+        }
+      } else {
+        console.error(JSON.stringify({ step: "PRICE_VERIFY_ERROR", error: priceErrMsg }));
+        return json({ ok: false, step: "STRIPE_ERROR", error: priceErrMsg }, 500);
+      }
     }
 
     // Step 6: Create checkout session
