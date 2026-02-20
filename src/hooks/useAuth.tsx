@@ -9,6 +9,7 @@ interface AuthContextType {
   user: User | null;
   profile: { display_name: string | null; avatar_url: string | null; email: string | null } | null;
   plan: SubscriptionPlan;
+  lifetimeAccess: boolean;
   isLoading: boolean;
   signOut: () => Promise<void>;
   refreshSubscription: () => Promise<void>;
@@ -19,6 +20,7 @@ const AuthContext = createContext<AuthContextType>({
   user: null,
   profile: null,
   plan: "free",
+  lifetimeAccess: false,
   isLoading: true,
   signOut: async () => {},
   refreshSubscription: async () => {},
@@ -29,6 +31,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
   const [user, setUser] = useState<User | null>(null);
   const [profile, setProfile] = useState<AuthContextType["profile"]>(null);
   const [plan, setPlan] = useState<SubscriptionPlan>("free");
+  const [lifetimeAccess, setLifetimeAccess] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
 
   const fetchProfile = async (userId: string) => {
@@ -36,30 +39,29 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
     if (data) setProfile(data);
   };
 
-  // Always read directly from DB — never rely on stale check-subscription edge function cache
-  // Accepts explicit userId to avoid stale closure bug when called from onAuthStateChange
-  const refreshSubscription = useCallback(async (currentUser?: User | null) => {
-    // Prefer the explicitly-passed user to avoid capturing a stale `user` from closure
-    const uid = currentUser?.id ?? user?.id;
-    if (!uid) return;
+  // Server-side entitlement read via edge function — single source of truth
+  const refreshSubscription = useCallback(async () => {
     try {
-      const { data, error } = await supabase
-        .from("subscriptions")
-        .select("plan, status")
-        .eq("user_id", uid)
-        .maybeSingle();
-
+      const { data, error } = await supabase.functions.invoke("refresh-entitlement");
       if (error) {
-        console.error("[useAuth] refreshSubscription query error:", error.message);
+        console.error("[useAuth] refresh-entitlement error:", error.message);
+        // Fallback: direct DB read
+        const { data: { session: sess } } = await supabase.auth.getSession();
+        if (sess?.user) {
+          const { data: subData } = await supabase
+            .from("subscriptions")
+            .select("plan, status")
+            .eq("user_id", sess.user.id)
+            .maybeSingle();
+          if (subData?.plan) setPlan(subData.plan as SubscriptionPlan);
+        }
         return;
       }
-      if (data?.plan) {
-        setPlan(data.plan as SubscriptionPlan);
-      }
+      if (data?.plan) setPlan(data.plan as SubscriptionPlan);
+      if (data?.lifetime_access !== undefined) setLifetimeAccess(data.lifetime_access);
     } catch (err) {
       console.error("[useAuth] refreshSubscription error:", err);
     }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -72,11 +74,12 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       if (session?.user) {
         setTimeout(() => {
           fetchProfile(session.user.id);
-          refreshSubscription(session.user);
+          refreshSubscription();
         }, 0);
       } else {
         setProfile(null);
         setPlan("free");
+        setLifetimeAccess(false);
       }
     });
 
@@ -87,7 +90,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       setUser(session?.user ?? null);
       if (session?.user) {
         await fetchProfile(session.user.id);
-        await refreshSubscription(session.user);
+        await refreshSubscription();
       }
       setIsLoading(false);
     };
@@ -96,26 +99,12 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
     return () => { mounted = false; subscription.unsubscribe(); };
   }, []);
 
-  // Periodic subscription refresh every 60s to catch webhook-triggered updates
-  // Capture user via ref to avoid re-creating interval on every user state change
+  // Periodic refresh every 60s
   useEffect(() => {
     if (!user) return;
-    const uid = user.id;
-    const interval = setInterval(async () => {
-      try {
-        const { data } = await supabase
-          .from("subscriptions")
-          .select("plan, status")
-          .eq("user_id", uid)
-          .maybeSingle();
-        if (data?.plan) setPlan(data.plan as SubscriptionPlan);
-      } catch (e) {
-        console.error("[useAuth] periodic refresh error:", e);
-      }
-    }, 60000);
+    const interval = setInterval(() => refreshSubscription(), 60000);
     return () => clearInterval(interval);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [user?.id]);
+  }, [user?.id, refreshSubscription]);
 
   const signOut = async () => {
     await supabase.auth.signOut();
@@ -123,10 +112,11 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
     setUser(null);
     setProfile(null);
     setPlan("free");
+    setLifetimeAccess(false);
   };
 
   return (
-    <AuthContext.Provider value={{ session, user, profile, plan, isLoading, signOut, refreshSubscription }}>
+    <AuthContext.Provider value={{ session, user, profile, plan, lifetimeAccess, isLoading, signOut, refreshSubscription }}>
       {children}
     </AuthContext.Provider>
   );
