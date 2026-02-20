@@ -21,6 +21,8 @@ export type Database = {
           display_name: string | null
           email: string | null
           id: string
+          lifetime_access: boolean
+          stripe_customer_id: string | null
           updated_at: string
           user_id: string
         }
@@ -30,6 +32,8 @@ export type Database = {
           display_name?: string | null
           email?: string | null
           id?: string
+          lifetime_access?: boolean
+          stripe_customer_id?: string | null
           updated_at?: string
           user_id: string
         }
@@ -39,6 +43,8 @@ export type Database = {
           display_name?: string | null
           email?: string | null
           id?: string
+          lifetime_access?: boolean
+          stripe_customer_id?: string | null
           updated_at?: string
           user_id?: string
         }
@@ -71,6 +77,45 @@ export type Database = {
           is_featured?: boolean
           min_plan?: Database["public"]["Enums"]["subscription_plan"]
           title?: string
+        }
+        Relationships: []
+      }
+      purchases: {
+        Row: {
+          amount: number | null
+          created_at: string
+          currency: string | null
+          id: string
+          price_id: string | null
+          status: string | null
+          stripe_checkout_session_id: string | null
+          stripe_customer_id: string | null
+          stripe_payment_intent_id: string | null
+          user_id: string
+        }
+        Insert: {
+          amount?: number | null
+          created_at?: string
+          currency?: string | null
+          id?: string
+          price_id?: string | null
+          status?: string | null
+          stripe_checkout_session_id?: string | null
+          stripe_customer_id?: string | null
+          stripe_payment_intent_id?: string | null
+          user_id: string
+        }
+        Update: {
+          amount?: number | null
+          created_at?: string
+          currency?: string | null
+          id?: string
+          price_id?: string | null
+          status?: string | null
+          stripe_checkout_session_id?: string | null
+          stripe_customer_id?: string | null
+          stripe_payment_intent_id?: string | null
+          user_id?: string
         }
         Relationships: []
       }

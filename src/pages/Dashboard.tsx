@@ -40,34 +40,24 @@ const Dashboard = () => {
   const handlePostCheckoutRefresh = async () => {
     setRefreshing(true);
     try {
-      // Force JWT refresh so the new plan is reflected in token claims
       await supabase.auth.refreshSession();
-      // Poll until DB reflects the new plan (webhook may arrive within seconds)
-      let attempts = 0;
-      const maxAttempts = 8;
-      const pollInterval = 2000; // 2s between polls
+      // Poll server-side entitlement until plan updates (webhook may take a few seconds)
+      const maxAttempts = 10;
+      const pollInterval = 2000;
 
-      const poll = async (): Promise<void> => {
+      for (let i = 0; i < maxAttempts; i++) {
         await refreshSubscription();
-        // Remount PlanStatusCard to fetch fresh data
         setPlanCardKey((k) => k + 1);
-        attempts++;
-        // Check if the plan was updated — re-poll if still free and attempts remain
-        if (attempts < maxAttempts) {
-          const { data } = await supabase
-            .from("subscriptions")
-            .select("plan")
-            .eq("user_id", user!.id)
-            .maybeSingle();
-          if (data?.plan === "free" && attempts < maxAttempts) {
-            await new Promise((r) => setTimeout(r, pollInterval));
-            return poll();
-          }
+        // Check if plan updated from free
+        const { data } = await supabase.functions.invoke("refresh-entitlement");
+        if (data?.plan && data.plan !== "free") {
+          toast.success("Payment confirmed! Your plan has been activated.");
+          return;
         }
-      };
-
-      await poll();
-      toast.success("Payment confirmed! Your plan has been activated.");
+        await new Promise((r) => setTimeout(r, pollInterval));
+      }
+      // After max attempts, still show success (webhook may be delayed)
+      toast.success("Payment received! Your plan will activate shortly.");
     } catch (err) {
       console.error("[Dashboard] Post-checkout refresh error:", err);
       toast.error("Could not refresh billing status — please reload the page.");
