@@ -10,23 +10,6 @@ const corsHeaders = {
 const log = (step: string, details?: unknown) =>
   console.log(`[CUSTOMER-PORTAL] ${step}${details ? " | " + JSON.stringify(details) : ""}`);
 
-/** Decode JWT payload without verifying signature. Safe here because:
- *  1. verify_jwt = false means Supabase already stripped tampered requests upstream.
- *  2. We only use sub/email for DB lookups — no privilege escalation possible.
- */
-function decodeJwtPayload(token: string): Record<string, unknown> | null {
-  try {
-    const parts = token.split(".");
-    if (parts.length !== 3) return null;
-    const base64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
-    const padded = base64.padEnd(base64.length + (4 - (base64.length % 4)) % 4, "=");
-    const json = atob(padded);
-    return JSON.parse(json);
-  } catch {
-    return null;
-  }
-}
-
 serve(async (req) => {
   if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
 
@@ -48,31 +31,28 @@ serve(async (req) => {
 
     const token = authHeader.replace("Bearer ", "").trim();
 
-    // Decode JWT payload locally — avoids network call to auth server which requires
-    // a server-side session and fails with ES256/RS256 tokens from Lovable Cloud.
-    const claims = decodeJwtPayload(token);
-    if (!claims || !claims.sub) {
-      console.error("[CUSTOMER-PORTAL] JWT decode failed or missing sub claim");
+    // Use Supabase SDK to validate JWT — consistent with create-checkout
+    const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
+    const supabaseAnonKey = Deno.env.get("SUPABASE_ANON_KEY") ?? "";
+    const authClient = createClient(supabaseUrl, supabaseAnonKey, {
+      global: { headers: { Authorization: authHeader } },
+    });
+
+    const { data: claimsData, error: claimsError } = await authClient.auth.getClaims(token);
+    if (claimsError || !claimsData?.claims) {
+      console.error("[CUSTOMER-PORTAL] Auth failed:", claimsError?.message ?? "No claims");
       return new Response(JSON.stringify({ error: "Not authenticated" }), {
         status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
 
-    // Reject expired tokens
-    if (typeof claims.exp === "number" && claims.exp < Math.floor(Date.now() / 1000)) {
-      console.error("[CUSTOMER-PORTAL] JWT expired");
-      return new Response(JSON.stringify({ error: "Not authenticated" }), {
-        status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
-    }
-
-    const userId = claims.sub as string;
-    const userEmail = (claims.email ?? claims.user_email) as string | undefined;
+    const userId = claimsData.claims.sub as string;
+    const userEmail = claimsData.claims.email as string | undefined;
     log("User authenticated", { userId });
 
     // Service role for reading stripe_customer_id without RLS
     const supabase = createClient(
-      Deno.env.get("SUPABASE_URL") ?? "",
+      supabaseUrl,
       Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "",
       { auth: { persistSession: false } }
     );
@@ -118,7 +98,7 @@ serve(async (req) => {
   } catch (error) {
     const msg = (error as Error).message;
     console.error("[CUSTOMER-PORTAL] Error:", msg);
-    return new Response(JSON.stringify({ error: msg }), {
+    return new Response(JSON.stringify({ error: "Portal request failed" }), {
       status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
   }
