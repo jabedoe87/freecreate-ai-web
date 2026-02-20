@@ -8,7 +8,6 @@ const KNOWN_ROUTES = [
   "/", "/dashboard", "/create-prompt", "/my-prompts", "/templates",
   "/upgrade", "/auth", "/login", "/signup", "/app", "/home", "/pricing",
   "/privacy-policy", "/terms-of-service", "/refund-policy", "/cookie-policy",
-  "/debug/billing",
 ];
 
 const NotFound = () => {
