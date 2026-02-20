@@ -19,9 +19,20 @@ const CreatePrompt = () => {
   const [saving, setSaving] = useState(false);
   const [showUpgradeModal, setShowUpgradeModal] = useState(false);
 
+  const TITLE_MAX = 200;
+  const CONTENT_MAX = 10000;
+
   const handleSave = async () => {
     if (!title.trim() || !content.trim()) {
       toast.error("Please fill in both title and content");
+      return;
+    }
+    if (title.trim().length > TITLE_MAX) {
+      toast.error(`Title must be ${TITLE_MAX} characters or less`);
+      return;
+    }
+    if (content.trim().length > CONTENT_MAX) {
+      toast.error(`Content must be ${CONTENT_MAX.toLocaleString()} characters or less`);
       return;
     }
     // Block generation and show paywall if free user is at limit
@@ -96,8 +107,10 @@ const CreatePrompt = () => {
               placeholder="e.g. Blog Post Generator"
               value={title}
               onChange={(e) => setTitle(e.target.value)}
+              maxLength={TITLE_MAX}
               className="bg-background"
             />
+            <span className="text-xs text-muted-foreground">{title.length}/{TITLE_MAX}</span>
           </div>
           <div className="space-y-2">
             <label className="text-sm font-medium text-foreground">Prompt Content</label>
@@ -105,8 +118,10 @@ const CreatePrompt = () => {
               placeholder="Write your prompt here... Be specific about what you want the AI to generate."
               value={content}
               onChange={(e) => setContent(e.target.value)}
+              maxLength={CONTENT_MAX}
               className="bg-background min-h-[200px]"
             />
+            <span className="text-xs text-muted-foreground">{content.length}/{CONTENT_MAX.toLocaleString()}</span>
           </div>
           <div className="flex gap-3">
             <Button onClick={handleSave} disabled={saving} className="flex-1">
