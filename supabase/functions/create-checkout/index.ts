@@ -44,14 +44,16 @@ serve(async (req) => {
       global: { headers: { Authorization: authHeader } },
     });
 
-    const { data: authData, error: authError } = await supabase.auth.getUser(token);
-    if (authError || !authData?.user) {
-      console.error(JSON.stringify({ step: "AUTH_FAILED", error: authError?.message ?? "No user" }));
-      return json({ ok: false, step: "AUTH_FAILED", error: authError?.message ?? "Invalid token" }, 401);
+    // Use getClaims() instead of getUser() — works with ES256 signing keys (Lovable Cloud)
+    const { data: claimsData, error: claimsError } = await supabase.auth.getClaims(token);
+    if (claimsError || !claimsData?.claims) {
+      console.error(JSON.stringify({ step: "AUTH_FAILED", error: claimsError?.message ?? "No claims" }));
+      return json({ ok: false, step: "AUTH_FAILED", error: claimsError?.message ?? "Invalid token" }, 401);
     }
 
-    const user = authData.user;
-    console.log(JSON.stringify({ step: "AUTH_SUCCESS", userId: user.id, email: user.email }));
+    const userId = claimsData.claims.sub as string;
+    const userEmail = claimsData.claims.email as string | undefined;
+    console.log(JSON.stringify({ step: "AUTH_SUCCESS", userId, email: userEmail }));
 
     // Step 3: Parse body
     let body: Record<string, unknown>;
@@ -132,9 +134,9 @@ serve(async (req) => {
     const sessionParams: Stripe.Checkout.SessionCreateParams = {
       mode: mode as "subscription" | "payment",
       line_items: [{ price: priceId, quantity: 1 }],
-      metadata: { user_id: user.id, plan_id: plan },
-      client_reference_id: user.id,
-      customer_email: user.email ?? undefined,
+      metadata: { user_id: userId, plan_id: plan },
+      client_reference_id: userId,
+      customer_email: userEmail ?? undefined,
       success_url: `${origin}/dashboard?checkout=success`,
       cancel_url: `${origin}/upgrade`,
     };
