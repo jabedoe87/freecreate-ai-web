@@ -63,8 +63,15 @@ const MyPrompts = () => {
 
   const saveEdit = async () => {
     if (!editingId) return;
-    await supabase.from("user_prompts").update({ title: editTitle, content: editContent }).eq("id", editingId);
-    setPrompts((prev) => prev.map((p) => (p.id === editingId ? { ...p, title: editTitle, content: editContent } : p)));
+    const trimmedTitle = editTitle.trim();
+    const trimmedContent = editContent.trim();
+    if (!trimmedTitle) { toast.error("Title cannot be empty"); return; }
+    if (trimmedTitle.length > 200) { toast.error("Title must be 200 characters or less"); return; }
+    if (!trimmedContent) { toast.error("Content cannot be empty"); return; }
+    if (trimmedContent.length > 10000) { toast.error("Content must be 10,000 characters or less"); return; }
+    const { error } = await supabase.from("user_prompts").update({ title: trimmedTitle, content: trimmedContent }).eq("id", editingId);
+    if (error) { toast.error("Failed to update prompt: " + (error.message.includes("check") ? "Title or content exceeds length limit" : error.message)); return; }
+    setPrompts((prev) => prev.map((p) => (p.id === editingId ? { ...p, title: trimmedTitle, content: trimmedContent } : p)));
     setEditingId(null);
     toast.success("Prompt updated");
   };
