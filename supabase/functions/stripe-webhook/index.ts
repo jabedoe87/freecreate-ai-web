@@ -44,7 +44,15 @@ serve(async (req) => {
   let event: Stripe.Event;
   try {
     if (webhookSecret && signature) {
-      event = stripe.webhooks.constructEvent(rawBody, signature, webhookSecret);
+      // CRITICAL: Use constructEventAsync with SubtleCryptoProvider for Deno compatibility
+      event = await stripe.webhooks.constructEventAsync(
+        rawBody,
+        signature,
+        webhookSecret,
+        undefined,
+        Stripe.createSubtleCryptoProvider()
+      );
+      log("SIGNATURE_VERIFIED");
     } else {
       log("WARNING_NO_SIGNATURE_VERIFICATION");
       event = JSON.parse(rawBody) as Stripe.Event;
@@ -95,7 +103,7 @@ serve(async (req) => {
       // ── checkout.session.completed ──────────────────────────────────────
       case "checkout.session.completed": {
         const session = obj as Stripe.Checkout.Session;
-        const userId = session.metadata?.user_id;
+        const userId = session.metadata?.user_id ?? session.client_reference_id;
         const planId = session.metadata?.plan_id;
 
         log("CHECKOUT_COMPLETED", { userId, planId, customerId, mode: session.mode, sessionId: session.id });
@@ -113,9 +121,15 @@ serve(async (req) => {
           });
         }
 
+        // Store stripe_customer_id on profiles for all plans
+        if (customerId) {
+          await supabase.from("profiles").update({
+            stripe_customer_id: customerId,
+          }).eq("user_id", userId);
+        }
+
         if (planId === "bundle") {
           // ── BUNDLE: one-time payment ──
-          // 1) Update subscriptions table
           const { error: subErr } = await supabase.from("subscriptions").update({
             plan: "bundle",
             status: "active",
@@ -125,25 +139,23 @@ serve(async (req) => {
           }).eq("user_id", userId);
           if (subErr) log("BUNDLE_SUB_UPDATE_ERROR", { error: subErr.message });
 
-          // 2) Update profiles with lifetime_access
           const { error: profErr } = await supabase.from("profiles").update({
             lifetime_access: true,
             stripe_customer_id: customerId ?? null,
           }).eq("user_id", userId);
           if (profErr) log("BUNDLE_PROFILE_UPDATE_ERROR", { error: profErr.message });
 
-          // 3) Insert purchase record (idempotent by session id)
+          // Insert purchase record
           const { error: purchErr } = await supabase.from("purchases").insert({
             user_id: userId,
             stripe_customer_id: customerId ?? null,
             stripe_checkout_session_id: session.id,
             stripe_payment_intent_id: (session.payment_intent as string) ?? null,
-            price_id: session.line_items?.data?.[0]?.price?.id ?? Deno.env.get("STRIPE_PRICE_BUNDLE") ?? null,
+            price_id: Deno.env.get("STRIPE_PRICE_BUNDLE") ?? null,
             amount: session.amount_total ?? 4900,
             currency: session.currency ?? "eur",
             status: "completed",
           });
-          // Ignore unique constraint violations (idempotent)
           if (purchErr && purchErr.code !== "23505") {
             log("PURCHASE_INSERT_ERROR", { error: purchErr.message });
           }
@@ -175,15 +187,9 @@ serve(async (req) => {
           }).eq("user_id", userId);
           if (subErr) log("PRO_SUB_UPDATE_ERROR", { error: subErr.message });
 
-          // Update profiles with stripe_customer_id
-          await supabase.from("profiles").update({
-            stripe_customer_id: customerId ?? null,
-          }).eq("user_id", userId);
-
           log("PRO_ACTIVATED", { userId, periodEnd });
         }
 
-        // Store user_id on stripe_events for debugging
         await supabase.from("stripe_events").update({ user_id: userId }).eq("event_id", event.id);
         break;
       }
