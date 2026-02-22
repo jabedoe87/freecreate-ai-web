@@ -59,10 +59,22 @@ serve(async (req) => {
     }
   } catch (err) {
     log("SIGNATURE_FAILED", { error: (err as Error).message });
-    return new Response("Signature verification failed", { status: 400 });
+    return new Response(JSON.stringify({ error: "Signature verification failed" }), {
+      status: 400,
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
   }
 
   log("EVENT_RECEIVED", { id: event.id, type: event.type });
+
+  // Guard: ensure event has proper Stripe structure
+  if (!event?.data?.object) {
+    log("INVALID_EVENT_STRUCTURE", { id: event?.id, type: event?.type });
+    return new Response(JSON.stringify({ error: "Invalid event structure" }), {
+      status: 400,
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
+  }
 
   // Idempotency check
   const { data: existingEvent } = await supabase
