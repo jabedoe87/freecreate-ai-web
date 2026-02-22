@@ -30,6 +30,11 @@ serve(async (req) => {
   }
 
   const webhookSecret = Deno.env.get("STRIPE_WEBHOOK_SECRET");
+  if (!webhookSecret) {
+    console.error(JSON.stringify({ fn: "stripe-webhook", step: "MISSING_SECRET", key: "STRIPE_WEBHOOK_SECRET" }));
+    return new Response("Server misconfiguration", { status: 500 });
+  }
+
   const stripe = new Stripe(stripeKey, { apiVersion: "2025-08-27.basil" });
 
   const supabase = createClient(
@@ -41,22 +46,24 @@ serve(async (req) => {
   const rawBody = await req.text();
   const signature = req.headers.get("stripe-signature");
 
+  if (!signature) {
+    log("MISSING_SIGNATURE_HEADER");
+    return new Response(JSON.stringify({ error: "Missing stripe-signature header" }), {
+      status: 400,
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
+  }
+
   let event: Stripe.Event;
   try {
-    if (webhookSecret && signature) {
-      // CRITICAL: Use constructEventAsync with SubtleCryptoProvider for Deno compatibility
-      event = await stripe.webhooks.constructEventAsync(
-        rawBody,
-        signature,
-        webhookSecret,
-        undefined,
-        Stripe.createSubtleCryptoProvider()
-      );
-      log("SIGNATURE_VERIFIED");
-    } else {
-      log("WARNING_NO_SIGNATURE_VERIFICATION");
-      event = JSON.parse(rawBody) as Stripe.Event;
-    }
+    event = await stripe.webhooks.constructEventAsync(
+      rawBody,
+      signature,
+      webhookSecret,
+      undefined,
+      Stripe.createSubtleCryptoProvider()
+    );
+    log("SIGNATURE_VERIFIED");
   } catch (err) {
     log("SIGNATURE_FAILED", { error: (err as Error).message });
     return new Response(JSON.stringify({ error: "Signature verification failed" }), {
