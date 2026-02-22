@@ -11,6 +11,12 @@ const corsHeaders = {
 const log = (step: string, details?: unknown) =>
   console.log(JSON.stringify({ fn: "stripe-webhook", step, ...(details ? { details } : {}) }));
 
+const ok = (body: Record<string, unknown> = { received: true }) =>
+  new Response(JSON.stringify(body), {
+    status: 200,
+    headers: { ...corsHeaders, "Content-Type": "application/json" },
+  });
+
 const getPriceToPlan = (): Record<string, string> => {
   const map: Record<string, string> = {};
   const pro = Deno.env.get("STRIPE_PRICE_PRO");
@@ -24,14 +30,10 @@ serve(async (req) => {
   if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
 
   const stripeKey = Deno.env.get("STRIPE_SECRET_KEY");
-  if (!stripeKey) {
-    console.error(JSON.stringify({ fn: "stripe-webhook", step: "MISSING_SECRET", key: "STRIPE_SECRET_KEY" }));
-    return new Response("Server misconfiguration", { status: 500 });
-  }
-
   const webhookSecret = Deno.env.get("STRIPE_WEBHOOK_SECRET");
-  if (!webhookSecret) {
-    console.error(JSON.stringify({ fn: "stripe-webhook", step: "MISSING_SECRET", key: "STRIPE_WEBHOOK_SECRET" }));
+
+  if (!stripeKey || !webhookSecret) {
+    console.error(JSON.stringify({ fn: "stripe-webhook", step: "MISSING_SECRET" }));
     return new Response("Server misconfiguration", { status: 500 });
   }
 
@@ -43,15 +45,13 @@ serve(async (req) => {
     { auth: { persistSession: false } }
   );
 
+  // CRITICAL: Read raw body FIRST for signature verification
   const rawBody = await req.text();
   const signature = req.headers.get("stripe-signature");
 
   if (!signature) {
-    log("MISSING_SIGNATURE_HEADER");
-    return new Response(JSON.stringify({ error: "Missing stripe-signature header" }), {
-      status: 400,
-      headers: { ...corsHeaders, "Content-Type": "application/json" },
-    });
+    log("MISSING_SIGNATURE");
+    return new Response("Missing stripe-signature header", { status: 400 });
   }
 
   let event: Stripe.Event;
@@ -66,106 +66,78 @@ serve(async (req) => {
     log("SIGNATURE_VERIFIED");
   } catch (err) {
     log("SIGNATURE_FAILED", { error: (err as Error).message });
-    return new Response(JSON.stringify({ error: "Signature verification failed" }), {
-      status: 400,
-      headers: { ...corsHeaders, "Content-Type": "application/json" },
-    });
+    return new Response("Signature verification failed", { status: 400 });
   }
 
   log("EVENT_RECEIVED", { id: event.id, type: event.type });
 
-  // Guard: ensure event has proper Stripe structure
-  if (!event?.data?.object) {
-    log("INVALID_EVENT_STRUCTURE", { id: event?.id, type: event?.type });
-    return new Response(JSON.stringify({ error: "Invalid event structure" }), {
-      status: 400,
-      headers: { ...corsHeaders, "Content-Type": "application/json" },
-    });
-  }
-
-  // Idempotency check
-  const { data: existingEvent } = await supabase
+  // Idempotency: check stripe_events table
+  const { data: existing } = await supabase
     .from("stripe_events")
     .select("id, status")
     .eq("event_id", event.id)
     .maybeSingle();
 
-  if (existingEvent) {
+  if (existing) {
     log("IDEMPOTENT_SKIP", { event_id: event.id });
-    return new Response(JSON.stringify({ received: true, skipped: true }), {
-      status: 200,
-      headers: { ...corsHeaders, "Content-Type": "application/json" },
-    });
+    return ok({ received: true, skipped: true });
   }
 
   const obj = event.data.object as any;
   const customerId = obj.customer as string | undefined;
 
   // Claim idempotency slot
-  const { error: insertError } = await supabase.from("stripe_events").insert({
+  const { error: insertErr } = await supabase.from("stripe_events").insert({
     event_id: event.id,
     type: event.type,
     status: "processing",
     customer_id: customerId ?? null,
   });
 
-  if (insertError?.code === "23505") {
-    log("RACE_CONDITION_SKIP", { event_id: event.id });
-    return new Response(JSON.stringify({ received: true, skipped: true }), {
-      status: 200,
-      headers: { ...corsHeaders, "Content-Type": "application/json" },
-    });
+  if (insertErr?.code === "23505") {
+    log("RACE_SKIP", { event_id: event.id });
+    return ok({ received: true, skipped: true });
   }
 
+  // MUST always return 200 to Stripe after valid signature — wrap in try/catch
   try {
     switch (event.type) {
-      // ── checkout.session.completed ──────────────────────────────────────
+      // ── checkout.session.completed ──────────────────────────────
       case "checkout.session.completed": {
         const session = obj as Stripe.Checkout.Session;
         const userId = session.metadata?.user_id ?? session.client_reference_id;
-        const planId = session.metadata?.plan_id;
+        // Accept both plan_id and purchase_type metadata keys
+        const planId = (session.metadata?.plan_id ?? session.metadata?.purchase_type ?? "").toLowerCase();
 
-        log("CHECKOUT_COMPLETED", { userId, planId, customerId, mode: session.mode, sessionId: session.id });
+        log("CHECKOUT_COMPLETED", { userId, planId, customerId, mode: session.mode });
 
         if (!userId || !planId) {
           log("MISSING_METADATA", { userId, planId });
           await supabase.from("stripe_events").update({
-            status: "error",
-            error: "Missing user_id or plan_id in metadata",
-            user_id: userId ?? null,
+            status: "error", error: "Missing user_id or plan_id", user_id: userId ?? null,
           }).eq("event_id", event.id);
-          return new Response(JSON.stringify({ received: true }), {
-            status: 200,
-            headers: { ...corsHeaders, "Content-Type": "application/json" },
-          });
+          return ok();
         }
 
-        // Store stripe_customer_id on profiles for all plans
+        // Store stripe_customer_id on profiles
         if (customerId) {
-          await supabase.from("profiles").update({
-            stripe_customer_id: customerId,
-          }).eq("user_id", userId);
+          await supabase.from("profiles").update({ stripe_customer_id: customerId }).eq("user_id", userId);
         }
 
         if (planId === "bundle") {
-          // ── BUNDLE: one-time payment ──
-          const { error: subErr } = await supabase.from("subscriptions").update({
-            plan: "bundle",
-            status: "active",
+          // BUNDLE: one-time payment → set lifetime_access, plan=bundle
+          await supabase.from("subscriptions").update({
+            plan: "bundle", status: "active",
             stripe_customer_id: customerId ?? null,
-            stripe_subscription_id: null,
-            current_period_end: null,
+            stripe_subscription_id: null, current_period_end: null,
           }).eq("user_id", userId);
-          if (subErr) log("BUNDLE_SUB_UPDATE_ERROR", { error: subErr.message });
 
-          const { error: profErr } = await supabase.from("profiles").update({
-            lifetime_access: true,
-            stripe_customer_id: customerId ?? null,
+          await supabase.from("profiles").update({
+            lifetime_access: true, stripe_customer_id: customerId ?? null,
           }).eq("user_id", userId);
-          if (profErr) log("BUNDLE_PROFILE_UPDATE_ERROR", { error: profErr.message });
 
-          // Insert purchase record
-          const { error: purchErr } = await supabase.from("purchases").insert({
+          // Record purchase
+          await supabase.from("purchases").insert({
             user_id: userId,
             stripe_customer_id: customerId ?? null,
             stripe_checkout_session_id: session.id,
@@ -174,15 +146,14 @@ serve(async (req) => {
             amount: session.amount_total ?? 4900,
             currency: session.currency ?? "eur",
             status: "completed",
+          }).then(({ error }) => {
+            if (error && error.code !== "23505") log("PURCHASE_INSERT_ERR", { error: error.message });
           });
-          if (purchErr && purchErr.code !== "23505") {
-            log("PURCHASE_INSERT_ERROR", { error: purchErr.message });
-          }
 
-          log("BUNDLE_ACTIVATED", { userId, customerId });
+          log("BUNDLE_ACTIVATED", { userId });
 
         } else if (planId === "pro") {
-          // ── PRO: subscription ──
+          // PRO: subscription
           let periodEnd: string | null = null;
           let stripeSubId: string | null = (session.subscription as string) ?? null;
 
@@ -193,18 +164,16 @@ serve(async (req) => {
               periodEnd = ts ? new Date(ts * 1000).toISOString() : null;
               stripeSubId = sub.id;
             } catch (e) {
-              log("SUB_RETRIEVE_ERROR", { error: (e as Error).message });
+              log("SUB_RETRIEVE_ERR", { error: (e as Error).message });
             }
           }
 
-          const { error: subErr } = await supabase.from("subscriptions").update({
-            plan: "pro",
-            status: "active",
+          await supabase.from("subscriptions").update({
+            plan: "pro", status: "active",
             stripe_customer_id: customerId ?? null,
             stripe_subscription_id: stripeSubId,
             current_period_end: periodEnd,
           }).eq("user_id", userId);
-          if (subErr) log("PRO_SUB_UPDATE_ERROR", { error: subErr.message });
 
           log("PRO_ACTIVATED", { userId, periodEnd });
         }
@@ -213,7 +182,7 @@ serve(async (req) => {
         break;
       }
 
-      // ── customer.subscription.created / updated ────────────────────────
+      // ── customer.subscription.updated ──────────────────────────
       case "customer.subscription.created":
       case "customer.subscription.updated": {
         const sub = obj as Stripe.Subscription;
@@ -223,15 +192,14 @@ serve(async (req) => {
         const ts = (sub as any).current_period_end;
         const periodEnd = ts ? new Date(ts * 1000).toISOString() : null;
 
-        log(event.type, { customerId, planId, priceId, subId: sub.id });
-
+        // Find user by stripe_customer_id or subscription metadata
         const { data: subRow } = await supabase
           .from("subscriptions")
           .select("user_id, plan")
           .eq("stripe_customer_id", customerId ?? "")
           .maybeSingle();
 
-        const userId = subRow?.user_id ?? obj.metadata?.user_id;
+        const userId = subRow?.user_id ?? sub.metadata?.user_id;
 
         if (userId) {
           if (subRow?.plan === "bundle") {
@@ -245,13 +213,11 @@ serve(async (req) => {
             current_period_end: periodEnd,
           }).eq("user_id", userId);
           log("SUB_UPDATED", { userId, planId, status: sub.status });
-        } else {
-          log("NO_USER_FOR_SUB_EVENT", { customerId });
         }
         break;
       }
 
-      // ── customer.subscription.deleted ───────────────────────────────────
+      // ── customer.subscription.deleted ──────────────────────────
       case "customer.subscription.deleted": {
         const { data: subRow } = await supabase
           .from("subscriptions")
@@ -265,63 +231,51 @@ serve(async (req) => {
             break;
           }
           await supabase.from("subscriptions").update({
-            plan: "free",
-            status: "canceled",
-            stripe_subscription_id: null,
-            current_period_end: null,
+            plan: "free", status: "canceled",
+            stripe_subscription_id: null, current_period_end: null,
           }).eq("user_id", subRow.user_id);
           log("DOWNGRADED_TO_FREE", { userId: subRow.user_id });
         }
         break;
       }
 
-      // ── invoice.paid ────────────────────────────────────────────────────
+      // ── invoice.paid ───────────────────────────────────────────
       case "invoice.paid": {
-        const invoice = obj as Stripe.Invoice;
-        const subId = (invoice as any).subscription as string | undefined;
+        const subId = (obj as any).subscription as string | undefined;
         if (subId) {
-          const ts = (invoice as any).period_end;
+          const ts = (obj as any).period_end;
           const endDate = ts ? new Date(ts * 1000).toISOString() : null;
           await supabase.from("subscriptions").update({
-            status: "active",
-            current_period_end: endDate,
+            status: "active", current_period_end: endDate,
           }).eq("stripe_subscription_id", subId);
           log("INVOICE_PAID", { subId, endDate });
         }
         break;
       }
 
-      // ── invoice.payment_failed ──────────────────────────────────────────
+      // ── invoice.payment_failed ─────────────────────────────────
       case "invoice.payment_failed": {
-        const invoice = obj as Stripe.Invoice;
-        const subId = (invoice as any).subscription as string | undefined;
+        const subId = (obj as any).subscription as string | undefined;
         if (subId) {
-          await supabase.from("subscriptions").update({
-            status: "past_due",
-          }).eq("stripe_subscription_id", subId);
+          await supabase.from("subscriptions").update({ status: "past_due" }).eq("stripe_subscription_id", subId);
           log("INVOICE_FAILED", { subId });
         }
         break;
       }
 
       default:
-        log("UNHANDLED_EVENT", { type: event.type });
+        log("UNHANDLED", { type: event.type });
     }
 
     await supabase.from("stripe_events").update({ status: "success" }).eq("event_id", event.id);
-    log("EVENT_PROCESSED", { event_id: event.id });
+    log("DONE", { event_id: event.id });
+    return ok();
 
-    return new Response(JSON.stringify({ received: true }), {
-      status: 200,
-      headers: { ...corsHeaders, "Content-Type": "application/json" },
-    });
   } catch (error) {
     const msg = (error as Error).message;
     console.error(JSON.stringify({ fn: "stripe-webhook", step: "HANDLER_ERROR", error: msg }));
     await supabase.from("stripe_events").update({ status: "error", error: msg }).eq("event_id", event.id);
-    return new Response(JSON.stringify({ received: true, error: msg }), {
-      status: 200,
-      headers: { ...corsHeaders, "Content-Type": "application/json" },
-    });
+    // MUST return 200 to Stripe even on internal errors
+    return ok({ received: true, error: msg });
   }
 });
