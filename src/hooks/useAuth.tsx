@@ -42,16 +42,28 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
   // Server-side entitlement read via edge function — single source of truth
   const refreshSubscription = useCallback(async () => {
     try {
+      // Don't call the edge function if there's no valid session
+      const { data: { session: currentSession } } = await supabase.auth.getSession();
+      if (!currentSession?.access_token) {
+        console.warn("[useAuth] No valid session, skipping refresh-entitlement");
+        return;
+      }
+
       const { data, error } = await supabase.functions.invoke("refresh-entitlement");
       if (error) {
         console.error("[useAuth] refresh-entitlement error:", error.message);
+        // If 401/403, session is invalid — sign out gracefully
+        if (error.message?.includes("401") || error.message?.includes("Unauthorized") || error.message?.includes("Invalid token")) {
+          console.warn("[useAuth] Session invalid, signing out");
+          await supabase.auth.signOut();
+          return;
+        }
         // Fallback: direct DB read
-        const { data: { session: sess } } = await supabase.auth.getSession();
-        if (sess?.user) {
+        if (currentSession?.user) {
           const { data: subData } = await supabase
             .from("subscriptions")
             .select("plan, status")
-            .eq("user_id", sess.user.id)
+            .eq("user_id", currentSession.user.id)
             .maybeSingle();
           if (subData?.plan) setPlan(subData.plan as SubscriptionPlan);
         }
