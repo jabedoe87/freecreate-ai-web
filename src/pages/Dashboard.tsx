@@ -41,22 +41,26 @@ const Dashboard = () => {
     setRefreshing(true);
     try {
       await supabase.auth.refreshSession();
-      // Poll server-side entitlement until plan updates (webhook may take a few seconds)
+      // Poll using check-subscription which verifies against Stripe AND updates DB,
+      // rather than refresh-entitlement which only reads DB (webhook may be delayed)
       const maxAttempts = 10;
       const pollInterval = 2000;
 
       for (let i = 0; i < maxAttempts; i++) {
-        await refreshSubscription();
-        setPlanCardKey((k) => k + 1);
-        // Check if plan updated from free
-        const { data } = await supabase.functions.invoke("refresh-entitlement");
-        if (data?.plan && data.plan !== "free") {
+        // check-subscription queries Stripe directly, finds active sub/bundle, and writes to DB
+        const { data: checkData } = await supabase.functions.invoke("check-subscription");
+        if (checkData?.plan && checkData.plan !== "free") {
+          // Now refresh the auth context so the UI updates globally
+          await refreshSubscription();
+          setPlanCardKey((k) => k + 1);
           toast.success("Payment confirmed! Your plan has been activated.");
           return;
         }
         await new Promise((r) => setTimeout(r, pollInterval));
       }
-      // After max attempts, still show success (webhook may be delayed)
+      // Final attempt: refresh from DB in case webhook landed
+      await refreshSubscription();
+      setPlanCardKey((k) => k + 1);
       toast.success("Payment received! Your plan will activate shortly.");
     } catch (err) {
       console.error("[Dashboard] Post-checkout refresh error:", err);
@@ -70,8 +74,9 @@ const Dashboard = () => {
     setRefreshing(true);
     try {
       await supabase.auth.refreshSession();
+      // Use check-subscription to verify against Stripe and update DB
+      await supabase.functions.invoke("check-subscription");
       await refreshSubscription();
-      // Remount PlanStatusCard to fetch live data
       setPlanCardKey((k) => k + 1);
       toast.success("Billing status refreshed");
     } catch (err) {
