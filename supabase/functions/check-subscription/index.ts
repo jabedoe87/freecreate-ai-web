@@ -3,6 +3,7 @@ import Stripe from "https://esm.sh/stripe@18.5.0";
 import { createClient } from "npm:@supabase/supabase-js@2.57.2";
 
 const ALLOWED_ORIGINS = [
+  "https://freecreate-ai-web.vercel.app",
   "https://freecreate-ai-web.lovable.app",
   "https://id-preview--4afd299d-0541-43bb-8bc9-40b03b775383.lovable.app",
   "http://localhost:8080",

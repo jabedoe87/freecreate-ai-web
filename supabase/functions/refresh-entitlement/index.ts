@@ -2,6 +2,7 @@ import { serve } from "https://deno.land/std@0.190.0/http/server.ts";
 import { createClient } from "npm:@supabase/supabase-js@2.57.2";
 
 const ALLOWED_ORIGINS = [
+  "https://freecreate-ai-web.vercel.app",
   "https://freecreate-ai-web.lovable.app",
   "https://id-preview--4afd299d-0541-43bb-8bc9-40b03b775383.lovable.app",
   "http://localhost:8080",
